@@ -18,6 +18,7 @@
 #include <thread>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include <exdisp.h>
@@ -158,6 +159,7 @@ static void LoadConfig() {
         if (!cur) continue;
         if (line.rfind(L"title:", 0) == 0) { cur->title = Trim(line.substr(6)); continue; }
         if (line.rfind(L"desc:", 0) == 0) { cur->desc = Trim(line.substr(5)); continue; }
+        if (line.rfind(L"note:", 0) == 0) { cur->note = Trim(line.substr(5)); continue; }
         if (line.rfind(L"section:", 0) == 0) { cur->section = Trim(line.substr(8)); continue; }
         if (line.rfind(L"icon:", 0) == 0) { cur->icon = Trim(line.substr(5)); continue; }
         if (line.rfind(L"value:", 0) == 0) { cur->value = Trim(line.substr(6)); continue; }
@@ -484,6 +486,21 @@ static void Evaluate(InstanceHandle h) {
         }
     }
     for (auto* s : wanted) ApplySetter(h, *s);
+}
+
+// Evaluates an element and every descendant already in the model.
+static void EvaluateSubtree(InstanceHandle root) {
+    std::vector<InstanceHandle> todo{root};
+    std::unordered_set<InstanceHandle> seen;
+    while (!todo.empty()) {
+        InstanceHandle h = todo.back();
+        todo.pop_back();
+        if (!seen.insert(h).second) continue;
+        auto it = g_nodes.find(h);
+        if (it == g_nodes.end()) continue;
+        todo.insert(todo.end(), it->second.children.begin(), it->second.children.end());
+        Evaluate(h);
+    }
 }
 
 // Dia's own code may reset values (e.g. toggling Visibility); re-assert ours.
@@ -847,7 +864,10 @@ public:
                 if (std::find(ch.begin(), ch.end(), el.Handle) == ch.end()) ch.push_back(el.Handle);
             } else if (std::find(g_roots.begin(), g_roots.end(), el.Handle) == g_roots.end())
                 g_roots.push_back(el.Handle);
-            Evaluate(el.Handle);
+            // Its children can be reported before it (e.g. the existing tree, walked when the engine
+            // attaches to a running Dia). Rules that look at ancestors (upN=, parentName=, ancestor=...)
+            // couldn't match them then, so evaluate them again now that this element is known.
+            EvaluateSubtree(el.Handle);
             if (!name.empty()) Ui_ElementAdded(name);
         } else {
             auto it = g_nodes.find(el.Handle);

@@ -79,6 +79,7 @@ Verified in Dia on this machine with screenshots (on, then off again, unless not
 | Hide sidebar button | `hideSidebarButton` | Done, verified. |
 | Hide Chat button | `hideChatButton` | Done, verified (also from the Settings switch). |
 | Hide Chats button / Hide recent tabs button | — | Dia for Windows has no such buttons. |
+| Clean search box | `cleanSearchBox` | Done, verified (empty, typing with suggestions, long text, off again). Only the box on Dia's New Tab page (under `VariantHost`), not the Ctrl+L command bar or chat. The box's bottom row (`ToolbarArea`: "Add tabs or files" + send) is moved into the text's row (`InputContent`, row 1 of `CommandBarContentGrid`), right-aligned and level with the text; everything in it but `SubmitButton` is collapsed, its 48 px row is set to 0, the grid's `MinHeight` (96) to 0 and the card's bottom padding to 0, so the box is one 60 px line. Dia leaves 32 px right of the text for ↑; while typing the button widens ("Google ↵", "Chat"), so the text row gets a right margin of the extra width and wraps before the button. Off puts every value back. |
 | Profile emoji | `profileEmoji` | Done, verified. One emoji (set in Settings → Patches) at the top of the sidebar; not per-profile. |
 | Hide pinned tab border | `hidePinnedTabBorder` | Done (applied to all pinned tabs; not seen with a pinned tab selected). |
 | Translucent sidebar | `translucentSidebar` | Done, verified. |

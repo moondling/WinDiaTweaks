@@ -158,6 +158,7 @@ static void LoadConfig() {
         if (!cur) continue;
         if (line.rfind(L"title:", 0) == 0) { cur->title = Trim(line.substr(6)); continue; }
         if (line.rfind(L"desc:", 0) == 0) { cur->desc = Trim(line.substr(5)); continue; }
+        if (line.rfind(L"note:", 0) == 0) { cur->note = Trim(line.substr(5)); continue; }
         if (line.rfind(L"section:", 0) == 0) { cur->section = Trim(line.substr(8)); continue; }
         if (line.rfind(L"icon:", 0) == 0) { cur->icon = Trim(line.substr(5)); continue; }
         if (line.rfind(L"value:", 0) == 0) { cur->value = Trim(line.substr(6)); continue; }

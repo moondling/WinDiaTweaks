@@ -461,6 +461,32 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
         d.Foreground(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)));
         text.Children().Append(d);
     }
+    if (!t.note.empty()) {  // a caution: warning icon and text in the caution color
+        muxc::Grid n;  // (a grid, so the text wraps)
+        n.ColumnSpacing(6);
+        n.Margin({0, 4, 0, 0});
+        muxc::ColumnDefinition n0, n1;
+        n0.Width(mux::GridLengthHelper::Auto());
+        n1.Width({1, mux::GridUnitType::Star});
+        n.ColumnDefinitions().Append(n0);
+        n.ColumnDefinitions().Append(n1);
+        auto color = BrushRes(L"SystemFillColorCautionBrush", Rgba(0xfc, 0xe1, 0x00));
+        muxc::FontIcon w;
+        w.Glyph(L"\xE7BA");  // (warning)
+        w.FontSize(12);
+        w.Foreground(color);
+        w.VerticalAlignment(mux::VerticalAlignment::Top);
+        w.Margin({0, 2, 0, 0});
+        n.Children().Append(w);
+        muxc::TextBlock d;
+        d.Text(t.note);
+        d.FontSize(12);
+        d.TextWrapping(mux::TextWrapping::Wrap);
+        d.Foreground(color);
+        muxc::Grid::SetColumn(d, 1);
+        n.Children().Append(d);
+        text.Children().Append(n);
+    }
     muxc::Grid::SetColumn(text, 1);
     row.Children().Append(text);
 
@@ -2390,21 +2416,69 @@ static bool ChatWorking() {
     return icon && icon.Glyph().size() == 1 && icon.Glyph()[0] == kChatBusyGlyph;
 }
 
-// Dia chimes when a chat reply is done (a MediaPlayer in this process). While a tidy runs, this
-// process's own audio is muted on every output: only Dia's interface sounds, since web pages play
-// their sound from Chromium's separate audio process. Whatever was muted before stays muted.
-static thread_local std::vector<std::pair<winrt::com_ptr<ISimpleAudioVolume>, BOOL>> t_tidyMuted;
+// Dia chimes when a chat reply is done (a MediaPlayer in this process). While a tidy runs, every audio
+// session of this process is muted on every output: only Dia's interface sounds, since web pages play
+// their sound from Chromium's separate audio process. The player may open its own session just as it
+// plays, so new sessions are watched for too (and muted as they're made). Whatever was muted before
+// stays muted.
+static std::mutex g_tidyMuteLock;
+static bool g_tidyMuting = false;  // (read on the audio thread that reports new sessions)
+static std::vector<std::pair<winrt::com_ptr<ISimpleAudioVolume>, BOOL>> g_tidyMuted;  // (and what it was)
 static thread_local ULONGLONG t_tidyUnmuteAt = 0;
+
+static void MuteIfOurs(IAudioSessionControl* c) {
+    winrt::com_ptr<IAudioSessionControl2> c2;
+    winrt::com_ptr<ISimpleAudioVolume> v;
+    DWORD pid = 0;
+    if (!c || FAILED(c->QueryInterface(IID_PPV_ARGS(c2.put()))) || FAILED(c2->GetProcessId(&pid)) ||
+        pid != GetCurrentProcessId() || FAILED(c->QueryInterface(IID_PPV_ARGS(v.put()))))
+        return;
+    std::lock_guard lock(g_tidyMuteLock);
+    if (!g_tidyMuting) return;
+    BOOL was = FALSE;
+    v->GetMute(&was);
+    v->SetMute(TRUE, nullptr);
+    g_tidyMuted.push_back({v, was});
+}
+
+struct TidySessionWatch : IAudioSessionNotification {
+    std::atomic<ULONG> refs{1};
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID id, void** out) override {
+        if (id == __uuidof(IUnknown) || id == __uuidof(IAudioSessionNotification)) return *out = this, AddRef(), S_OK;
+        *out = nullptr;
+        return E_NOINTERFACE;
+    }
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++refs; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG n = --refs;
+        if (!n) delete this;
+        return n;
+    }
+    HRESULT STDMETHODCALLTYPE OnSessionCreated(IAudioSessionControl* c) override {
+        MuteIfOurs(c);
+        return S_OK;
+    }
+};
+static thread_local std::vector<std::pair<winrt::com_ptr<IAudioSessionManager2>, winrt::com_ptr<TidySessionWatch>>> t_tidyWatch;
 
 static void MuteDiaSounds(bool mute) {
     if (!mute) {
-        for (auto& [v, was] : t_tidyMuted)
-            if (v) v->SetMute(was, nullptr);
-        t_tidyMuted.clear();
+        for (auto& [sm, w] : t_tidyWatch) sm->UnregisterSessionNotification(w.get());
+        t_tidyWatch.clear();
+        std::lock_guard lock(g_tidyMuteLock);
+        g_tidyMuting = false;
+        for (auto it = g_tidyMuted.rbegin(); it != g_tidyMuted.rend(); ++it)  // (a session seen twice: first was holds)
+            if (it->first) it->first->SetMute(it->second, nullptr);
+        g_tidyMuted.clear();
         t_tidyUnmuteAt = 0;
         return;
     }
-    if (!t_tidyMuted.empty()) return;
+    t_tidyUnmuteAt = 0;
+    if (!t_tidyWatch.empty()) return;
+    {
+        std::lock_guard lock(g_tidyMuteLock);
+        g_tidyMuting = true;
+    }
     try {
         auto en = winrt::create_instance<IMMDeviceEnumerator>(__uuidof(MMDeviceEnumerator));
         winrt::com_ptr<IMMDeviceCollection> all;
@@ -2413,16 +2487,30 @@ static void MuteDiaSounds(bool mute) {
         all->GetCount(&n);
         for (UINT i = 0; i < n; i++) {
             winrt::com_ptr<IMMDevice> dev;
-            winrt::com_ptr<IAudioSessionManager> sm;
-            winrt::com_ptr<ISimpleAudioVolume> vol;
+            winrt::com_ptr<IAudioSessionManager2> sm;
+            winrt::com_ptr<IAudioSessionEnumerator> list;
             if (FAILED(all->Item(i, dev.put())) ||
-                FAILED(dev->Activate(__uuidof(IAudioSessionManager), CLSCTX_ALL, nullptr, sm.put_void())) ||
-                FAILED(sm->GetSimpleAudioVolume(nullptr, FALSE, vol.put())))
+                FAILED(dev->Activate(__uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr, sm.put_void())) ||
+                FAILED(sm->GetSessionEnumerator(list.put())))  // (also needed before new sessions are reported)
                 continue;
-            BOOL was = FALSE;
-            vol->GetMute(&was);
-            vol->SetMute(TRUE, nullptr);
-            t_tidyMuted.push_back({vol, was});
+            int count = 0;
+            list->GetCount(&count);
+            for (int k = 0; k < count; k++) {
+                winrt::com_ptr<IAudioSessionControl> c;
+                if (SUCCEEDED(list->GetSession(k, c.put()))) MuteIfOurs(c.get());
+            }
+            winrt::com_ptr<ISimpleAudioVolume> def;  // (the default session, made now if there's none yet)
+            winrt::com_ptr<IAudioSessionManager> sm1 = sm.try_as<IAudioSessionManager>();
+            if (sm1 && SUCCEEDED(sm1->GetSimpleAudioVolume(nullptr, FALSE, def.put()))) {
+                std::lock_guard lock(g_tidyMuteLock);
+                BOOL was = FALSE;
+                def->GetMute(&was);
+                def->SetMute(TRUE, nullptr);
+                g_tidyMuted.push_back({def, was});
+            }
+            winrt::com_ptr<TidySessionWatch> w;
+            w.attach(new TidySessionWatch());
+            if (SUCCEEDED(sm->RegisterSessionNotification(w.get()))) t_tidyWatch.push_back({sm, w});
         }
     } catch (...) {
     }
@@ -2522,7 +2610,7 @@ static void CheckFreeze() {
 static void SetTidyBusy(bool busy);
 static void EnsureTidyFrames();
 static void EndTidy(const char* why) {
-    t_tidyUnmuteAt = GetTickCount64() + 2500;  // (the chime plays as the reply finishes)
+    t_tidyUnmuteAt = GetTickCount64() + 4000;  // (the chime plays as the reply finishes)
     Log("tidy: done (%s, %.1f s after the click)", why, (GetTickCount64() - t_tidy.clicked) / 1000.0);
     bool closing = false;
     if (t_tidy.opened)

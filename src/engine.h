@@ -11,7 +11,7 @@
 #include <vector>
 
 struct TweakInfo {
-    std::wstring key, title, desc, section, icon, value;
+    std::wstring key, title, desc, note, section, icon, value;  // note: a caution shown under desc
     std::vector<std::pair<std::wstring, std::wstring>> choices;  // value -> label
     bool enabled = false;
     bool noSwitch = false;  // "switch: none": its drop-down only (an option of another tweak)

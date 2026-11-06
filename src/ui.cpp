@@ -5803,6 +5803,7 @@ struct TitleBarState {
     // is held by Dia, so the row is capped at 0 instead). Held strongly: a weak reference to a
     // RowDefinition doesn't resolve, which left the row at 0 (no toolbar) after the tweak went off.
     muxc::RowDefinition row{nullptr};
+    double barHeight = 0;                   // the toolbar's height in its pane: our row's MinHeight
     // The sidebar's top row (menu, space name, tab search), lifted as far as the toolbar so they stay level.
     winrt::weak_ref<mux::FrameworkElement> header;
     mux::Thickness headerDia{}, headerOurs{};  // its margin as Dia had it, and as we set it
@@ -5968,15 +5969,22 @@ static void UpdateTitleBar() {
             st.bar = winrt::make_weak(active);
             st.from = winrt::make_weak(from);
             st.index = idx;
+            // The toolbar's height as its pane gives it, kept up here: Centered (Arc for Windows) takes most of
+            // its items into its strip, and in our Auto row the emptied toolbar shrank to a sliver (in the pane,
+            // the row holds it). Never lowered: a tab's toolbar may come up already emptied.
+            double barH = active.ActualHeight();
             // The pane's row holding the toolbar is closed up (its Height is Dia's, so its MaxHeight is capped).
             int r = muxc::Grid::GetRow(active);
             if (r >= 0 && (uint32_t)r < from.RowDefinitions().Size()) {
                 auto row = from.RowDefinitions().GetAt(r);
+                if (row.Height().GridUnitType == mux::GridUnitType::Pixel) barH = (std::max)(barH, row.Height().Value);
                 st.rowMax = row.MaxHeight();
                 st.row = row;
                 row.MaxHeight(0);
-                Log("title bar: moved; pane row %d capped (max %.0f -> %.0f)", r, st.rowMax, row.MaxHeight());
+                Log("title bar: moved; pane row %d capped (max %.0f -> %.0f), toolbar %.0f px", r, st.rowMax,
+                    row.MaxHeight(), barH);
             }
+            if (barH > st.barHeight) st.barHeight = barH, st.host.MinHeight(barH);
             st.host.Children().Append(active);
         }
         double lift = AlignTitleBarTop(st, main);

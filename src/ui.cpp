@@ -1795,12 +1795,23 @@ static void UpdateSidebarPageCorners() {
     t_sidebarPageClips.erase(std::remove_if(t_sidebarPageClips.begin(), t_sidebarPageClips.end(),
         [](const SidebarPageClip& state) { return !state.element.get() || state.visual.Clip() != state.clip; }),
         t_sidebarPageClips.end());
+    // Each tab view's page element, remembered: searching a view's whole tree every few ticks costs more
+    // than checking that the one found last time is still in it (a short walk up).
+    static thread_local std::map<InstanceHandle, winrt::weak_ref<mux::FrameworkElement>> pageOf;
+    for (auto it = pageOf.begin(); it != pageOf.end();) it = Obj<mux::FrameworkElement>(it->first) ? std::next(it) : pageOf.erase(it);
     for (auto handle : FindNodes(L"VariantHost")) {
         auto element = Obj<mux::FrameworkElement>(handle);
         if (!element) continue;
-        auto page = FindVisual(element, [](const mux::DependencyObject& node) {
-            return winrt::get_class_name(node) == L"NativeAppComponent.WindowlessContentsControl";
-        }).try_as<mux::FrameworkElement>();
+        auto page = pageOf.count(handle) ? pageOf[handle].get() : nullptr;
+        bool inside = false;
+        for (mux::DependencyObject d = page; d && !inside; d = muxm::VisualTreeHelper::GetParent(d)) inside = d == element;
+        if (!inside) {
+            page = FindVisual(element, [](const mux::DependencyObject& node) {
+                return winrt::get_class_name(node) == L"NativeAppComponent.WindowlessContentsControl";
+            }).try_as<mux::FrameworkElement>();
+            if (page) pageOf[handle] = winrt::make_weak(page);
+            else pageOf.erase(handle);
+        }
         if (!page) continue;
         auto visual = ElementCompositionPreview::GetElementChildVisual(page);
         if (!visual) continue;
@@ -4593,7 +4604,12 @@ static void ThemePopover(const mux::FrameworkElement& layout) {
         cachedAt = NowMs();
     }
     auto want = cached;
-    if (it == t_popoverThemes.end()) it = t_popoverThemes.emplace(id, PopoverTheme{winrt::make_weak(layout), layout.RequestedTheme()}).first;
+    if (it == t_popoverThemes.end()) {
+        // Popovers Dia has since destroyed are let go first, so the map holds only live ones.
+        for (auto d = t_popoverThemes.begin(); d != t_popoverThemes.end();)
+            d = d->second.layout.get() ? std::next(d) : t_popoverThemes.erase(d);
+        it = t_popoverThemes.emplace(id, PopoverTheme{winrt::make_weak(layout), layout.RequestedTheme()}).first;
+    }
     if (layout.RequestedTheme() != want) layout.RequestedTheme(want);
 }
 
@@ -6733,13 +6749,22 @@ void Ui_WatchProperty(InstanceHandle h, const std::wstring& prop) {
 // Toolbar in the title bar: Dia's drag button over the address box is gone up there and the address text
 // only displays (tweaks.conf), so a click on the field opens Dia's address box, as Ctrl+L does. Clicks on
 // the field's own buttons (site menu, ...) stay theirs.
-static thread_local std::set<InstanceHandle> t_addressClickHooked;
+// The fields already hooked, by the element itself (a handle can be reused for a new one), and only while
+// Dia keeps them: fields it has dropped (each tab brings its own) are let go as new ones come.
+static thread_local std::vector<winrt::weak_ref<mux::UIElement>> t_addressClickHooked;
 
 static void HookAddressClicks() {
     if (!TitleBarMoveOn()) return;
     for (auto h : FindNodes(L"AssistantBar")) {
         auto bar = Obj<mux::UIElement>(h);
-        if (!bar || !t_addressClickHooked.insert(h).second) continue;
+        if (!bar) continue;
+        bool hooked = false;
+        for (auto& w : t_addressClickHooked) hooked |= w.get() == bar;
+        if (hooked) continue;
+        t_addressClickHooked.erase(std::remove_if(t_addressClickHooked.begin(), t_addressClickHooked.end(),
+                                                  [](auto& w) { return !w.get(); }),
+                                   t_addressClickHooked.end());
+        t_addressClickHooked.push_back(winrt::make_weak(bar));
         bar.AddHandler(mux::UIElement::TappedEvent(),
                        winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const&,
                                                                             mux::Input::TappedRoutedEventArgs const& e) {
@@ -6788,7 +6813,7 @@ bool Ui_Tick() {
         try {
             UpdateTitleBar();
             HookAddressClicks();
-            if (TitleBarMoveOn()) HookCommandBarPopovers(false);  // the address box, centered under its field
+            // (New popovers are hooked as Dia adds them, ScheduleAnchor, and every few ticks by the look pass.)
         } catch (winrt::hresult_error const& e) {
             static int logged = 0;
             if (logged < 20) logged++, Log("ui tick error 0x%08lx (titleBar)", (unsigned long)e.code());

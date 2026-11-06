@@ -1294,6 +1294,15 @@ static bool ComputeNewTab() {
     return false;
 }
 
+// Toolbar in the title bar, the move itself (TitleBarMoveOn), from the tab layout and split view given. Hide
+// toolbar and the Arc URL bar in the sidebar lay the toolbar out themselves and take priority over it;
+// Centered (Arc for Windows) keeps its strip, which goes up with the toolbar. Split view keeps Dia's layout
+// (a toolbar in each pane). The colors stay in all of these.
+static bool TitleBarMoveWanted(bool topTabs, bool split) {
+    return Engine_TweakOn(L"titleBar") && !topTabs && !split && !Engine_TweakOn(L"hideToolbar") &&
+           !(Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") != L"windows");
+}
+
 static bool UpdateStates() {
     std::map<std::wstring, bool> now;
     now[L"sidebarOpen"] = ComputeSidebarOpen();
@@ -1313,6 +1322,8 @@ static bool UpdateStates() {
     for (auto h : FindNodes(L"TabStripContentHost"))
         if (auto fe = Obj<mux::FrameworkElement>(h); fe && ShownOnScreen(fe)) now[L"topTabs"] = true;
     if (now[L"topTabs"] != Ui_State(L"topTabs")) Log("tab layout: %s", now[L"topTabs"] ? "top bar" : "sidebar");
+    // The toolbar is up in the title bar: its rules (tweaks.conf) hold only then.
+    now[L"titleBarUp"] = TitleBarMoveWanted(now[L"topTabs"], now[L"split"]);
     bool changed = now != t_states;
     t_states = now;
     return changed;
@@ -1430,12 +1441,8 @@ static thread_local winrt::event_token t_lookToken{};
 // Only with Dia's sidebar tab layout: with tabs in the top bar the toolbar would cover them (topTabs in
 // UpdateStates), so the whole patch stands aside, colors too.
 static bool TitleBarOn() { return Engine_TweakOn(L"titleBar") && !Ui_State(L"topTabs"); }
-// The move itself: the Arc URL bar (either placement) and Hide toolbar lay the toolbar out themselves and
-// take priority over it; the colors stay with them. Split view keeps Dia's layout too (a toolbar in each
-// pane), in the sidebar's colors.
-static bool TitleBarMoveOn() {
-    return TitleBarOn() && !Engine_TweakOn(L"arcUrlBar") && !Engine_TweakOn(L"hideToolbar") && !Ui_State(L"split");
-}
+// The move itself (see TitleBarMoveWanted).
+static bool TitleBarMoveOn() { return TitleBarMoveWanted(Ui_State(L"topTabs"), Ui_State(L"split")); }
 // Arc (Windows) URL bar placement turns the colors on too: Arc's toolbar is the sidebar's color.
 static bool ToolbarSidebar() {
     return TitleBarOn() || (Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") == L"windows");
@@ -1781,10 +1788,10 @@ static bool ArcSidebarOn();
 
 static void UpdateSidebarPageCorners() {
     using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
-    // Only while no toolbar sits on the page's card: the toolbar up in the title bar, or the Arc URL bar in
-    // the sidebar, which hides the top toolbar (except in split view, where each pane keeps one for its
-    // close button). With Arc (Windows), Hide toolbar or split view the toolbar stays on the card, and
-    // rounded corners under it would leave notches.
+    // Only while no toolbar sits on the page's card: the toolbar up in the title bar (Centered's strip with
+    // it), or the Arc URL bar in the sidebar, which hides the top toolbar (except in split view, where each
+    // pane keeps one for its close button). With Hide toolbar or split view the toolbar stays on the card,
+    // and rounded corners under it would leave notches.
     bool exposed = TitleBarMoveOn() || (TitleBarOn() && ArcSidebarOn() && !Ui_State(L"split"));
     if (!exposed || Engine_TweakOn(L"squareCorners")) {
         for (auto& state : t_sidebarPageClips) {
@@ -4551,7 +4558,7 @@ static void CheckLiftedBar() {
 // but the toolbar now lives in our row above it. With a side panel open the pane is narrower, so the box
 // opened off to one side. Center it under the address field it belongs to instead (Dia's top is kept).
 static void AnchorToTitleBar(const mux::FrameworkElement& layout) {
-    if (!TitleBarMoveOn()) return;
+    if (!TitleBarMoveOn() || ArcWindowsOn()) return;  // (Centered opens its box over the window: PlaceCommandBar)
     auto canvas = muxm::VisualTreeHelper::GetParent(layout).try_as<mux::UIElement>();
     // A box that just opened isn't measured yet: Dia gives it its width up front, so use that.
     double width = layout.Width();
@@ -5290,7 +5297,20 @@ static void PlaceArcWinStrip(ArcWinBar& b) {
     auto group = b.group.get();
     auto src = b.st.source.get();
     if (!bar || !group || !src || src.ActualWidth() <= 0) return;
-    auto at = src.TransformToVisual(group).TransformPoint({0, 0});
+    // With Toolbar in the title bar the tab's toolbar is up in our row (diatweaksTitleBar), outside
+    // ContentGroup: the strip goes up with it, and back down when it returns.
+    muxc::Panel holder = group;
+    for (mux::DependencyObject d = src; d; d = muxm::VisualTreeHelper::GetParent(d))
+        if (auto g = d.try_as<muxc::Grid>(); g && g.Name() == L"diatweaksTitleBar") {
+            holder = g;
+            break;
+        }
+    if (auto cur = muxm::VisualTreeHelper::GetParent(bar).try_as<muxc::Panel>(); cur != holder) {
+        uint32_t i;
+        if (cur && cur.Children().IndexOf(bar, i)) cur.Children().RemoveAt(i);
+        holder.Children().Append(bar);
+    }
+    auto at = src.TransformToVisual(holder).TransformPoint({0, 0});
     auto m = bar.Margin();
     if (std::abs(m.Left - at.X) > 0.5 || std::abs(m.Top - at.Y) > 0.5) bar.Margin({at.X, at.Y, 0, 0});
     if (std::abs(bar.Width() - src.ActualWidth()) > 0.5 || std::isnan(bar.Width())) bar.Width(src.ActualWidth());
@@ -5300,10 +5320,10 @@ static void PlaceArcWinStrip(ArcWinBar& b) {
 static void ArcWinOff(ArcWinBar& b) {
     PutBackArcWin(b);
     ReturnMoved(b.st);
-    if (auto group = b.group.get())
-        if (auto bar = b.toolbar.get()) {
+    if (auto bar = b.toolbar.get())  // (in ContentGroup, or up in the title bar: PlaceArcWinStrip)
+        if (auto cur = muxm::VisualTreeHelper::GetParent(bar).try_as<muxc::Panel>()) {
             uint32_t i;
-            if (group.Children().IndexOf(bar, i)) group.Children().RemoveAt(i);
+            if (cur.Children().IndexOf(bar, i)) cur.Children().RemoveAt(i);
         }
 }
 
@@ -6759,7 +6779,8 @@ void Ui_WatchProperty(InstanceHandle h, const std::wstring& prop) {
 static thread_local std::vector<winrt::weak_ref<mux::UIElement>> t_addressClickHooked;
 
 static void HookAddressClicks() {
-    if (!TitleBarMoveOn()) return;
+    // (Centered keeps the address text a display itself and opens its own box on a click.)
+    if (!TitleBarMoveOn() || ArcWindowsOn()) return;
     for (auto h : FindNodes(L"AssistantBar")) {
         auto bar = Obj<mux::UIElement>(h);
         if (!bar) continue;
@@ -6774,7 +6795,7 @@ static void HookAddressClicks() {
                        winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const&,
                                                                             mux::Input::TappedRoutedEventArgs const& e) {
                            try {
-                               if (!TitleBarMoveOn()) return;
+                               if (!TitleBarMoveOn() || ArcWindowsOn()) return;
                                for (auto d = e.OriginalSource().try_as<mux::DependencyObject>(); d;
                                     d = muxm::VisualTreeHelper::GetParent(d)) {
                                    if (d.try_as<muxc::Primitives::ButtonBase>()) return;

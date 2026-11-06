@@ -282,6 +282,22 @@ static void RunProbe() {
             ProbeRegions(o);
             continue;
         }
+        if (nm.rfind(L"HIT:", 0) == 0) {  // HIT:x,y (window DIPs): the elements under that point, topmost first
+            double x = _wtof(nm.c_str() + 4), y = _wtof(nm.c_str() + nm.find(L',') + 1);
+            for (auto h : FindNodes(L"SidebarBorder")) {
+                auto any = Obj<mux::FrameworkElement>(h);
+                if (!any || !any.XamlRoot()) continue;
+                int n = 0;
+                for (auto const& e : muxm::VisualTreeHelper::FindElementsInHostCoordinates(
+                         winrt::Windows::Foundation::Point{(float)x, (float)y}, any.XamlRoot().Content(), false)) {
+                    auto fe = e.try_as<mux::FrameworkElement>();
+                    o << "hit[" << n++ << "] " << N(std::wstring(winrt::get_class_name(e))) << " \"" << (fe ? N(std::wstring(fe.Name())) : "") << "\"\n";
+                    if (n > 25) break;
+                }
+                break;
+            }
+            continue;
+        }
         if (nm == L"FOCUS") {  // which element has keyboard focus, and its ancestors
             for (auto h : FindNodes(L"SidebarBorder")) {
                 auto any = Obj<mux::FrameworkElement>(h);
@@ -562,7 +578,7 @@ static mux::FrameworkElement ButtonRow(const wchar_t* glyph, const std::wstring&
 // afterwards makes it Custom (done in Engine_SetTweak).
 static thread_local winrt::weak_ref<muxc::ComboBox> t_presetBox;
 static const std::pair<const wchar_t*, const wchar_t*> kPresets[] = {
-    {L"none", L"None"}, {L"arc", L"Arc"}, {L"custom", L"Custom"}};
+    {L"none", L"None"}, {L"arc", L"Arc"}, {L"arcWindows", L"Arc (Windows)"}, {L"custom", L"Custom"}};
 
 static void ApplyPreset(const std::wstring& preset) {
     std::vector<std::pair<std::wstring, std::wstring>> values{{L"preset", preset}};
@@ -573,11 +589,19 @@ static void ApplyPreset(const std::wstring& preset) {
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
                                                L"peek"};
+    // Arc (Windows): the same, but like Arc for Windows the toolbar stays, in the sidebar's color, with
+    // the site centered in it (the Centered address bar).
+    static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",
+                                                      L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
+                                                      L"hideTabHoverCard", L"windowMaterial",   L"peek"};
+    bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
         if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"normalLaunch" && !t.noSwitch)  // settings, not patches
-            states.push_back({t.key, preset == L"arc" && arc.count(t.key) > 0});
-    if (preset == L"arc") values.push_back({L"windowMaterial", L"acrylic"});
+            states.push_back({t.key, (isArc && arc.count(t.key) > 0) || (isArcWindows && arcWindows.count(t.key) > 0)});
+    if (isArc || isArcWindows) values.push_back({L"windowMaterial", L"acrylic"});
+    if (isArc) values.push_back({L"arcUrlBar", L"sidebar"});
+    if (isArcWindows) values.push_back({L"arcUrlBar", L"windows"});
     Engine_SetMany(states, values);
 }
 
@@ -1332,7 +1356,11 @@ static thread_local bool t_lookPending = false;
 static thread_local winrt::event_token t_lookToken{};
 
 // On with "sidebar"; "off" (Adaptive) also covers `diatweaks set toolbarColor off`.
-static bool ToolbarSidebar() { return Engine_TweakOn(L"toolbarColor") && Engine_TweakValue(L"toolbarColor") != L"off"; }
+// Arc (Windows) URL bar placement turns it on too: Arc's toolbar is the sidebar's color.
+static bool ToolbarSidebar() {
+    return (Engine_TweakOn(L"toolbarColor") && Engine_TweakValue(L"toolbarColor") != L"off") ||
+           (Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") == L"windows");
+}
 
 static muxm::Brush LookClear() {
     static thread_local muxm::Brush b = muxm::SolidColorBrush(Rgba(0, 0, 0, 0));
@@ -1609,7 +1637,8 @@ static void PaletteRestoreAll() {
 // where they keep the sidebar color it gave them).
 static bool LookInChrome(mux::DependencyObject d) {
     for (int i = 0; d && i < 40; i++, d = muxm::VisualTreeHelper::GetParent(d))
-        if (auto fe = d.try_as<mux::FrameworkElement>(); fe && (fe.Name() == L"NavigationBarHost" || fe.Name() == L"RootGrid"))
+        if (auto fe = d.try_as<mux::FrameworkElement>();
+            fe && (fe.Name() == L"NavigationBarHost" || fe.Name() == L"RootGrid" || fe.Name() == L"diatweaksArcWinStrip"))
             return true;
     return false;
 }
@@ -1679,6 +1708,8 @@ static void UpdateToolbarLook() {
             }
         LookWalk(host, 0);
     }
+    for (auto h : FindNodes(L"diatweaksArcWinStrip"))  // Arc (Windows): the page's controls live here
+        if (auto strip = Obj<mux::DependencyObject>(h)) LookWalk(strip, 0);
     for (auto h : FindNodes(L"AssistantBar"))
         if (auto bar = Obj<muxc::Border>(h); bar && LookInChrome(bar)) LookField(bar);
     for (auto h : FindNodes(L"AddressRichEditBox"))
@@ -1818,6 +1849,11 @@ static void UpdateSquareCorners() {
                     t_corners.end());
 }
 
+// --- URL bar placement (arcUrlBar): "sidebar" = Arc (address bar in the sidebar), "windows" = Arc
+// (Windows) (the toolbar stays; just the site, centered in it).
+static bool ArcSidebarOn() { return Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") != L"windows"; }
+static bool ArcWindowsOn() { return Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") == L"windows"; }
+
 // --- Always show address field: the field's background and its buttons, not just on hover.
 struct FieldState {
     winrt::weak_ref<muxc::Border> bar;
@@ -1832,10 +1868,11 @@ static thread_local std::vector<ButtonsState> t_buttons;
 static thread_local std::vector<FieldState> t_field;
 
 static void UpdateAddressField() {
-    bool on = Engine_TweakOn(L"alwaysShowAddressField") || Engine_TweakOn(L"arcUrlBar");
+    bool on = Engine_TweakOn(L"alwaysShowAddressField") || Engine_TweakOn(L"arcUrlBar");  // (either Arc mode)
     if (on) {
         // In Arc mode the pill's background is drawn by our own (persistent) row, so Dia's per-tab field
-        // stays transparent and nothing about the pill changes when tabs come and go.
+        // stays transparent and nothing about the pill changes when tabs come and go. Arc (Windows) draws
+        // its own small pill around the centered site.
         static thread_local muxm::Brush clear = muxm::SolidColorBrush(Rgba(0, 0, 0, 0));
         auto fill = Engine_TweakOn(L"arcUrlBar") ? clear
                                                   : BrushRes(L"ControlFillColorDefaultBrush", Rgba(0xff, 0xff, 0xff, 0x0f));
@@ -1870,7 +1907,7 @@ static void UpdateAddressField() {
             if (bar.CornerRadius().TopLeft < 1) bar.CornerRadius({8, 8, 8, 8});
         }
         for (auto h : FindNodes(L"UrlBarTrailingStack")) {
-            if (Engine_TweakOn(L"arcUrlBar")) break;  // Arc URL bar shows them on hover itself
+            if (ArcSidebarOn()) break;  // Arc URL bar shows them on hover itself
             auto st = Obj<mux::FrameworkElement>(h);
             if (!st) continue;
             bool known = false;
@@ -2155,7 +2192,15 @@ static void ReturnMoved(ArcState& st) {
                 }
             }
         }
-        if (from) from.Children().InsertAt((std::min)(it->index, from.Children().Size()), el);
+        if (from) try {
+                from.Children().InsertAt((std::min)(it->index, from.Children().Size()), el);
+            } catch (winrt::hresult_error const& e) {
+                auto fe = el.try_as<mux::FrameworkElement>();
+                auto p = muxm::VisualTreeHelper::GetParent(el).try_as<mux::FrameworkElement>();
+                Log("arc: couldn't put %s back (0x%08lx), parent now %s %s", fe ? N(std::wstring(fe.Name())).c_str() : "?",
+                    (unsigned long)e.code(), p ? N(std::wstring(p.Name())).c_str() : "-",
+                    p ? N(std::wstring(winrt::get_class_name(p))).c_str() : "");
+            }
     }
     st.moved.clear();
     st.source = nullptr;
@@ -2507,7 +2552,7 @@ static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address) {
         if (!watchedDisplays.count(key)) {
             watchedDisplays.insert(key);
             d.RegisterPropertyChangedCallback(mux::UIElement::OpacityProperty(), [](mux::DependencyObject const& o, auto&&) {
-                if (!Engine_TweakOn(L"arcUrlBar")) return;
+                if (!ArcSidebarOn()) return;
                 auto fe = o.as<mux::UIElement>();
                 for (auto& [h, st] : t_arc)
                     if (st.display.get() == fe && fe.Opacity() != 0) fe.Opacity(0);
@@ -2521,7 +2566,7 @@ static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address) {
 
 // Dia keeps a separate toolbar for every tab. Find the one belonging to the tab on screen; if its
 // items are still in it (you just switched tabs), give the previous tab its items back and borrow these.
-static void AdoptActiveTab(ArcState& st) {
+static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     auto paging = st.paging.get();
     auto left = st.left.get(), right = st.right.get(), url = st.url.get();
     if (!paging || !left || !right || !url) return;
@@ -2608,7 +2653,7 @@ static void AdoptActiveTab(ArcState& st) {
     st.swapped = true;
     // Dia tints toolbar icons with the site's color; in the sidebar they use the sidebar's own color
     // (taken from Dia's ⌄ button in the same header).
-    if (auto header = st.header.get())
+    if (auto header = sidebar ? st.header.get() : nullptr)
         if (auto ref = FindByName(header, L"OverflowButton").try_as<muxc::Control>())
             for (auto el : {toggle, back, fwd, reload})
                 if (auto c = el.try_as<muxc::Control>()) {
@@ -2633,7 +2678,7 @@ static void AdoptActiveTab(ArcState& st) {
                     };
                     walk(c, 0);
                 }
-    AttachDisplay(st, address);
+    if (sidebar) AttachDisplay(st, address);
 }
 
 // The address editor opens in one of Dia's popovers (PopoverLayoutRoot on a placement canvas), which
@@ -2811,7 +2856,7 @@ static void CheckLiftedBar() {
     if (!t_lift.popup) return;
     auto layout = t_lift.layout.get();
     auto from = t_lift.from.get();
-    if (!layout || !from || !from.IsLoaded() || !Engine_TweakOn(L"arcUrlBar")) return UnliftCommandBar();
+    if (!layout || !from || !from.IsLoaded() || !ArcSidebarOn()) return UnliftCommandBar();
     // Open, but the sidebar is no longer floating: back to Dia's layer, placed for the docked sidebar.
     if (layout.Visibility() == mux::Visibility::Visible && !SidebarInPopup(layout.XamlRoot())) UnliftCommandBar();
 }
@@ -2826,8 +2871,9 @@ static void PlaceCommandBar(const mux::FrameworkElement& layout) {
         return fe && fe.Name() == L"CommandBarContainerRoot";
     }).try_as<mux::FrameworkElement>();
     if (!bar) return;  // some other popover (site menu, ...): leave it alone
-    bool floating = InNewTabMode();  // the Ctrl+T bar (Floating new tab bar patch)
-    bool arc = Engine_TweakOn(L"arcUrlBar");
+    // Centered over the page: the Ctrl+T bar (Floating new tab bar patch), and every bar in Arc (Windows).
+    bool floating = InNewTabMode() || ArcWindowsOn();
+    bool arc = ArcSidebarOn();
     if (!floating && !arc) {
         if (lifted) UnliftCommandBar();
         return UnplaceCommandBar(layout, bar);
@@ -2874,7 +2920,15 @@ static void PlaceCommandBar(const mux::FrameworkElement& layout) {
         double areaW = cfe.ActualWidth() - areaL;
         width = (std::min)(kCenteredWidth, areaW - 64);
         left = areaL + (areaW - width) / 2;
-        top = (std::max)(48.0, cfe.ActualHeight() * 0.14);  // upper part of the page, clear of its content
+        // As in Arc (measured from its UI tree): the search box ~40% down the window, suggestions growing
+        // below it, so the open bar sits around the middle and its box doesn't move as you type. Moved up
+        // only as far as needed to keep the whole bar on screen.
+        double h = cfe.ActualHeight();
+        double cardH = 0;
+        if (auto content = FindByName(layout, L"CommandBarContainerRoot")) cardH = content.ActualHeight();
+        top = h * 0.4 - 28;  // (the box's middle at 40%)
+        if (cardH > 0 && top + cardH > h - 24) top = h - 24 - cardH;
+        top = (std::max)(48.0, top);
     }
     if (std::abs(muxc::Canvas::GetLeft(layout) - left) > 0.5) muxc::Canvas::SetLeft(layout, left);
     if (std::abs(muxc::Canvas::GetTop(layout) - top) > 0.5) muxc::Canvas::SetTop(layout, top);
@@ -2934,14 +2988,18 @@ static void UpdateArcBar();
 // Swap our sidebar controls over right before the next frame is drawn, so no stale or half-styled
 // frame is ever shown.
 static void StyleStartPages();
+static void UpdateArcWindows();
 static void ScheduleArcAdopt() {
-    if (t_adoptPending || !Engine_TweakOn(L"arcUrlBar")) return;
+    if (t_adoptPending || (!Engine_TweakOn(L"arcUrlBar") && !Engine_TweakOn(L"floatingNewTab"))) return;
     t_adoptPending = true;
     t_adoptToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
         muxm::CompositionTarget::Rendering(t_adoptToken);
         t_adoptPending = false;
         try {
             UpdateArcBar();
+            UpdateArcWindows();
+            // A command bar Dia just opened: placed (centered) before it's ever drawn at Dia's own spot.
+            if ((ArcWindowsOn() || Engine_TweakOn(L"floatingNewTab")) && !ArcSidebarOn()) HookCommandBarPopovers();
             UpdateAddressField();
             StyleStartPages();
         } catch (...) {
@@ -2961,7 +3019,7 @@ void Ui_ElementAdded(const std::wstring& name) {
 }
 
 static void UpdateArcBar() {
-    bool on = Engine_TweakOn(L"arcUrlBar");
+    bool on = ArcSidebarOn();
     if (!on) {
         for (auto& [h, st] : t_arc) ArcOff(st);
         if (!t_arc.empty()) Log("Arc URL bar: off"), ResetCommandBars();
@@ -2993,6 +3051,586 @@ static void UpdateArcBar() {
     }
     for (auto it = t_arc.begin(); it != t_arc.end();)
         it = it->second.paging.get() ? std::next(it) : t_arc.erase(it);
+}
+
+// ---------------------------------------------------------------- Arc (Windows) URL bar
+// Like Arc for Windows (measured from Arc's own UI tree). Arc has one title bar for the whole window,
+// which stays put when tabs change; Dia has a toolbar per tab, rebuilt with every new tab. So, like the
+// Arc (sidebar) mode, Dia's real controls are moved into one strip of ours that lives in the window
+// (ContentGroup), laid over the selected tab's toolbar (left empty): back / forward / reload on the
+// left, the page's buttons on the right, and the address field as a small centered group: [☆] [site]
+// [⋯], like Arc's [link] [site] [site controls]. The site is 12 px text in the toolbar's icon color, on
+// a 28 px pill (radius 6) when hovered. Dia's own field stays under it (its text invisible, still
+// clickable), so a click opens Dia's command bar as usual; PlaceCommandBar centers that bar over the
+// window. Dia's loading bar is hidden (tweaks.conf). With the sidebar open, its toggle sits in the
+// sidebar header right after Dia's logo (UpdateArcWinHeaders).
+
+struct ArcWinBar {
+    winrt::weak_ref<muxc::Grid> toolbar;             // our strip (diatweaksArcWinStrip)
+    winrt::weak_ref<muxc::Grid> group;               // Dia's ContentGroup, which holds it
+    ArcState st;                                     // Dia's controls, moved into the strip
+    winrt::weak_ref<muxc::Border> pill;              // our hover background behind the site
+    winrt::weak_ref<muxc::TextBlock> label;          // our site-only text
+    winrt::weak_ref<mux::FrameworkElement> display;  // Dia's address text (AddressRichEditBox)
+    double displayOpacity = 1;
+    muxm::RectangleGeometry displayClip{nullptr};
+    // Dia's page buttons (☆, ⋯, ...), each slid to its spot in the group: (button, Dia's own transform)
+    std::vector<std::pair<winrt::weak_ref<mux::FrameworkElement>, muxm::Transform>> moved;
+    bool hover = false;
+    // Dia's field (AssistantBarHost) clipped to the centered group, so only the group takes the pointer
+    // (hover, click): (field, Dia's own clip)
+    winrt::weak_ref<mux::FrameworkElement> clipped;
+    muxm::RectangleGeometry fieldClip{nullptr};
+    // Dia lets ☆ / ⋯ take clicks only while it sees the pointer over its field; in the group they always
+    // do. (the row, Dia's binding / value for it)
+    winrt::weak_ref<mux::FrameworkElement> trailingHit;
+    mux::Data::BindingBase trailingBinding{nullptr};
+    wf::IInspectable trailingLocal{nullptr};
+};
+static thread_local std::map<InstanceHandle, ArcWinBar> t_arcWin;
+
+static void PutBackArcWinButtons(ArcWinBar& b) {
+    for (auto& [w, tr] : b.moved)
+        if (auto el = w.get()) el.RenderTransform(tr);
+    b.moved.clear();
+}
+
+static void PutBackArcWin(ArcWinBar& b) {
+    if (auto d = b.display.get()) {
+        b.display = nullptr;  // first: our opacity watch would hide it again
+        d.Opacity(b.displayOpacity);
+        d.Clip(b.displayClip);
+    }
+    PutBackArcWinButtons(b);
+    if (auto f = b.clipped.get()) f.Clip(b.fieldClip);
+    b.clipped = nullptr;
+    if (auto t = b.trailingHit.get()) {
+        if (b.trailingBinding) t.SetBinding(mux::UIElement::IsHitTestVisibleProperty(), b.trailingBinding);
+        else if (b.trailingLocal && b.trailingLocal != mux::DependencyProperty::UnsetValue())
+            t.SetValue(mux::UIElement::IsHitTestVisibleProperty(), b.trailingLocal);
+        else t.ClearValue(mux::UIElement::IsHitTestVisibleProperty());
+    }
+    b.trailingHit = nullptr;
+    if (auto bar = b.toolbar.get())
+        for (auto w : {b.label.get().try_as<mux::UIElement>(), b.pill.get().try_as<mux::UIElement>()}) {
+            uint32_t i;
+            if (w && bar.Children().IndexOf(w, i)) bar.Children().RemoveAt(i);
+        }
+}
+
+// Dia's text "site / page title" -> "site", without "www.". On hover Dia shows the full address
+// instead ("https://www.site.com/path"): that becomes "site.com" too, as Arc never shows more.
+static std::wstring SiteOf(std::wstring t) {
+    while (!t.empty() && iswspace(t.back())) t.pop_back();
+    while (!t.empty() && iswspace(t.front())) t.erase(0, 1);
+    size_t sep = t.find(L" / ");
+    if (sep != std::wstring::npos) t = t.substr(0, sep);
+    if (size_t scheme = t.find(L"://"); scheme != std::wstring::npos && t.find(L' ') == std::wstring::npos) {
+        t = t.substr(scheme + 3);
+        t = t.substr(0, t.find_first_of(L"/?#"));
+        if (size_t at = t.find(L'@'); at != std::wstring::npos) t = t.substr(at + 1);
+    }
+    if (t.rfind(L"www.", 0) == 0) t = t.substr(4);
+    return t;
+}
+
+static std::wstring SiteOnly(const muxc::RichEditBox& reb) {
+    winrt::hstring raw;
+    reb.Document().GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, raw);
+    return SiteOf(std::wstring(raw));
+}
+
+// What Ctrl+T's bar is opening in a new tab right now (empty when nothing is): typed address -> its site
+// ("github.com/x" -> "github.com"); a search stays as typed.
+static std::wstring RelayText();
+static std::wstring RelaySite() {
+    std::wstring t = RelayText();
+    if (t.empty() || t.find(L' ') != std::wstring::npos || t.find(L'.') == std::wstring::npos) return t;
+    if (t.find(L"://") == std::wstring::npos) t = L"https://" + t;
+    return SiteOf(t);
+}
+
+static void LayoutArcWin(ArcWinBar& b);
+
+static void LayoutArcWinSafe(const std::function<bool(const ArcWinBar&)>& which) {
+    for (auto& [h, b] : t_arcWin)
+        if (which(b)) {
+            try {
+                LayoutArcWin(b);
+            } catch (...) {
+            }
+        }
+}
+
+// Hide Dia's text (Dia rebuilds it when a tab navigates) and keep ours in step with it.
+static void AttachArcWinDisplay(ArcWinBar& b, const mux::FrameworkElement& host) {
+    auto d = FindByName(host, L"AddressRichEditBox");
+    auto cur = b.display.get();
+    if (cur == d) return;
+    if (cur) {
+        b.display = nullptr;
+        cur.Opacity(b.displayOpacity);
+        cur.Clip(b.displayClip);
+    }
+    if (!d) return;
+    b.display = winrt::make_weak(d);
+    b.displayOpacity = d.Opacity();
+    b.displayClip = d.Clip();
+    d.Opacity(0);
+    muxm::RectangleGeometry none;  // Dia animates its text on changes (overriding opacity while it runs)
+    none.Rect({0, 0, 0, 0});
+    d.Clip(none);
+    static thread_local std::set<void*> watched;
+    if (watched.insert(winrt::get_abi(d)).second) {
+        d.RegisterPropertyChangedCallback(mux::UIElement::OpacityProperty(), [](mux::DependencyObject const& o, auto&&) {
+            if (!ArcWindowsOn()) return;
+            auto fe = o.as<mux::UIElement>();
+            for (auto& [h, b] : t_arcWin)
+                if (b.display.get() == fe && fe.Opacity() != 0) fe.Opacity(0);
+        });
+        if (auto reb = d.try_as<muxc::RichEditBox>())
+            reb.TextChanged([](wf::IInspectable const& sender, auto&&) {
+                auto fe = sender.try_as<mux::FrameworkElement>();
+                LayoutArcWinSafe([fe](const ArcWinBar& b) { return b.display.get() == fe; });
+            });
+    }
+}
+
+// x of an element in the toolbar, without the slide we gave it.
+static double NaturalX(const mux::FrameworkElement& el, const mux::UIElement& bar) {
+    double x = el.TransformToVisual(bar).TransformPoint({0, 0}).X;
+    if (auto t = el.RenderTransform().try_as<muxm::TranslateTransform>()) x -= t.X();
+    return x;
+}
+
+static void SlideTo(ArcWinBar& b, const mux::FrameworkElement& el, const mux::UIElement& bar, double x) {
+    bool known = false;
+    for (auto& [w, tr] : b.moved)
+        if (w.get() == el) known = true;
+    if (!known) {
+        b.moved.push_back({winrt::make_weak(el), el.RenderTransform()});
+        el.RenderTransform(muxm::TranslateTransform());
+    }
+    auto t = el.RenderTransform().try_as<muxm::TranslateTransform>();
+    if (!t) return;
+    double dx = x - NaturalX(el, bar);
+    if (std::abs(t.X() - dx) > 0.5) t.X(dx);
+}
+
+// The group [☆] [site] [⋯] in the middle of the toolbar.
+static void LayoutArcWin(ArcWinBar& b) {
+    auto bar = b.toolbar.get();
+    auto label = b.label.get();
+    auto pill = b.pill.get();
+    if (!bar || !label || !pill) return;
+    auto host = FindByName(bar, L"AssistantBarHost");
+    bool shown = host && host.Visibility() == mux::Visibility::Visible && host.ActualWidth() > 0;
+    if (shown) AttachArcWinDisplay(b, host);
+    auto reb = b.display.get().try_as<muxc::RichEditBox>();
+    // (On Dia's New Tab page the field says "New Tab": that's the empty state too.)
+    std::wstring text = shown && reb && !Ui_State(L"newTab") ? SiteOnly(reb) : L"";
+    // Ctrl+T's bar is opening an address in a new tab: the strip keeps the current tab's buttons (see
+    // UpdateArcWindows) but shows the new address straight away, as Arc does.
+    if (auto relay = RelaySite(); !relay.empty() && host) text = relay, shown = true;
+    // No site (Dia's start page, an empty tab): Arc's "Search or Enter URL…" pill, which opens the
+    // command bar (Dia's own field is hidden there, so the pill takes the click itself).
+    bool empty = text.empty();
+    if (empty) text = L"Search or Enter URL…";
+    if (label.Text() != text) label.Text(text);
+    if (label.Visibility() != mux::Visibility::Visible) label.Visibility(mux::Visibility::Visible), pill.Visibility(mux::Visibility::Visible);
+    // The pill is the site's button, as in Arc: a click opens the command bar (Ctrl+L), whatever Dia's
+    // field under it does.
+    if (!pill.IsHitTestVisible()) pill.IsHitTestVisible(true);
+    // Arc draws the site in its icon color.
+    auto ref = FindByName(bar, L"ReloadButton").try_as<muxc::Control>();
+    auto fg = ref ? ref.Foreground() : reb ? reb.Foreground() : label.Foreground();
+    if (label.Foreground() != fg) label.Foreground(fg);
+
+    // Dia's page buttons that are showing: the first goes before the site, the rest after it.
+    std::vector<mux::FrameworkElement> buttons;
+    auto trailing = host ? FindByName(host, L"UrlBarTrailingStack").try_as<muxc::Panel>() : nullptr;
+    if (!empty && trailing && trailing.Visibility() == mux::Visibility::Visible)
+        for (auto const& c : trailing.Children())
+            if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.Visibility() == mux::Visibility::Visible && fe.ActualWidth() > 0)
+                buttons.push_back(fe);
+    // Buttons Dia hid since the last pass: give them their own transform back.
+    for (auto it = b.moved.begin(); it != b.moved.end();) {
+        auto el = it->first.get();
+        if (el && std::find(buttons.begin(), buttons.end(), el) != buttons.end()) ++it;
+        else {
+            if (el) el.RenderTransform(it->second);
+            it = b.moved.erase(it);
+        }
+    }
+
+    const double pad = 8, gap = 2;  // Arc: the site button's padding, the group's spacing
+    double barW = bar.ActualWidth();
+    double fieldL = 0, fieldR = barW, leftW = 0, rightW = 0;
+    if (shown) {
+        fieldL = host.TransformToVisual(bar).TransformPoint({0, 0}).X;
+        fieldR = fieldL + host.ActualWidth();
+    } else if (auto reload = FindByName(bar, L"ReloadButton")) {  // the field's spot: after reload
+        fieldL = reload.TransformToVisual(bar).TransformPoint({0, 0}).X + reload.ActualWidth() + 8;
+        fieldR = barW - 8;
+    }
+    for (size_t i = 0; i < buttons.size(); i++) (i == 0 ? leftW : rightW) += buttons[i].ActualWidth() + gap;
+
+    label.Measure({std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()});
+    auto lm = label.Margin();  // (DesiredSize includes it)
+    double textW = (double)label.DesiredSize().Width - lm.Left - lm.Right;
+    // The whole group centered in the toolbar, while it fits between back / forward / reload and the
+    // buttons on the right; else centered in the address field; the site shortened with … if need be.
+    double maxGroup = fieldR - fieldL - 8;
+    double room = (std::max)(0.0, maxGroup - leftW - rightW - 2 * pad);
+    double w = (std::min)(textW, room);
+    double group = leftW + w + 2 * pad + rightW;
+    double x = barW / 2 - group / 2;
+    if (x < fieldL + 4 || x + group > fieldR - 4) x = fieldL + (fieldR - fieldL - group) / 2;
+    if (std::abs(label.MaxWidth() - room) > 0.5) label.MaxWidth(room);
+
+    if (!buttons.empty()) SlideTo(b, buttons[0], bar, x);
+    double siteX = x + leftW;
+    double textX = siteX + pad;
+    if (std::abs(label.Margin().Left - textX) > 0.5) label.Margin({textX, 0, 0, 0});
+    if (std::abs(pill.Margin().Left - siteX) > 0.5) pill.Margin({siteX, 0, 0, 0});
+    if (std::abs(pill.Width() - (w + 2 * pad)) > 0.5 || std::isnan(pill.Width())) pill.Width(w + 2 * pad);
+    double rx = siteX + w + 2 * pad + gap;
+    for (size_t i = 1; i < buttons.size(); i++) {
+        SlideTo(b, buttons[i], bar, rx);
+        rx += buttons[i].ActualWidth() + gap;
+    }
+    // Arc's group is only as wide as its buttons and site: the rest of Dia's (full-width) field is cut
+    // away, so hovering or clicking beside the group does nothing.
+    if (host && shown) {
+        if (b.clipped.get() != host) {
+            if (auto old = b.clipped.get()) old.Clip(b.fieldClip);
+            b.clipped = winrt::make_weak(host);
+            b.fieldClip = host.Clip();
+            host.Clip(muxm::RectangleGeometry());
+        }
+        if (auto clip = host.Clip()) {
+            double hx = host.TransformToVisual(bar).TransformPoint({0, 0}).X;
+            winrt::Windows::Foundation::Rect r{(float)(x - hx - 2), 0.0f, (float)(group + 4), (float)host.ActualHeight()};
+            auto cur = clip.Rect();
+            if (std::abs(cur.X - r.X) > 0.5 || std::abs(cur.Width - r.Width) > 0.5 || std::abs(cur.Height - r.Height) > 0.5)
+                clip.Rect(r);
+        }
+    }
+    if (trailing && trailing.Opacity() != 1) trailing.Opacity(1);
+    if (trailing) {
+        if (b.trailingHit.get() != trailing) {
+            b.trailingHit = winrt::make_weak(trailing.as<mux::FrameworkElement>());
+            auto be = trailing.GetBindingExpression(mux::UIElement::IsHitTestVisibleProperty());
+            b.trailingBinding = be ? be.ParentBinding() : nullptr;
+            b.trailingLocal = trailing.ReadLocalValue(mux::UIElement::IsHitTestVisibleProperty());
+        }
+        if (!trailing.IsHitTestVisible()) trailing.IsHitTestVisible(true);
+    }
+    static thread_local muxm::Brush clear = muxm::SolidColorBrush(Rgba(0, 0, 0, 0));
+    auto fill = b.hover && empty ? BrushRes(L"SubtleFillColorTertiaryBrush", Rgba(0xff, 0xff, 0xff, 0x0a))
+                : b.hover || empty ? BrushRes(L"SubtleFillColorSecondaryBrush", Rgba(0xff, 0xff, 0xff, 0x0f))
+                                   : clear;
+    if (pill.Background() != fill) pill.Background(fill);
+}
+
+static HWND TopWindowFor(const mux::XamlRoot& root);
+
+static void BuildArcWin(ArcWinBar& b, const muxc::Grid& group) {
+    // The strip: [toggle back forward reload] [address field] [page buttons], over the selected tab's toolbar.
+    muxc::Grid bar;
+    bar.Name(L"diatweaksArcWinStrip");
+    bar.HorizontalAlignment(mux::HorizontalAlignment::Left);
+    bar.VerticalAlignment(mux::VerticalAlignment::Top);
+    for (auto w : {mux::GridLengthHelper::Auto(), mux::GridLengthHelper::FromValueAndType(1, mux::GridUnitType::Star),
+                   mux::GridLengthHelper::Auto()}) {
+        muxc::ColumnDefinition cd;
+        cd.Width(w);
+        bar.ColumnDefinitions().Append(cd);
+    }
+    muxc::StackPanel left, right;
+    muxc::Grid center;
+    for (auto p : {left, right}) {
+        p.Orientation(muxc::Orientation::Horizontal);
+        p.VerticalAlignment(mux::VerticalAlignment::Center);
+    }
+    left.Name(L"diatweaksArcWinLeft");
+    right.Name(L"diatweaksArcWinRight");
+    center.Name(L"diatweaksArcWinCenter");
+    center.VerticalAlignment(mux::VerticalAlignment::Center);  // Dia's field at its own height, centered
+    muxc::Grid::SetColumn(center, 1);
+    muxc::Grid::SetColumn(right, 2);
+    bar.Children().Append(left);
+    bar.Children().Append(center);
+    bar.Children().Append(right);
+    muxc::Grid::SetRowSpan(bar, (std::max)(1, (int)group.RowDefinitions().Size()));
+    muxc::Grid::SetColumnSpan(bar, (std::max)(1, (int)group.ColumnDefinitions().Size()));
+    muxc::Canvas::SetZIndex(bar, 100);
+    group.Children().Append(bar);
+    b.group = winrt::make_weak(group);
+    b.toolbar = winrt::make_weak(bar);
+    b.st.paging = winrt::make_weak(group);
+    b.st.bar = winrt::make_weak(bar);
+    b.st.left = winrt::make_weak(left.as<muxc::Panel>());
+    b.st.right = winrt::make_weak(left.as<muxc::Panel>());  // back / forward / reload follow the toggle
+    b.st.url = winrt::make_weak(center.as<muxc::Panel>());
+    int cols = 3, rows = 1;
+    muxc::Border pill;
+    pill.Name(L"diatweaksArcWinPill");
+    pill.IsHitTestVisible(false);
+    pill.Height(28);
+    pill.CornerRadius({6, 6, 6, 6});
+    pill.HorizontalAlignment(mux::HorizontalAlignment::Left);
+    pill.VerticalAlignment(mux::VerticalAlignment::Center);
+    muxc::TextBlock label;
+    label.Name(L"diatweaksArcWinLabel");
+    label.IsHitTestVisible(false);
+    label.FontSize(12);
+    label.FontFamily(muxm::FontFamily(L"Segoe UI Variable Text, Segoe UI"));
+    label.TextTrimming(mux::TextTrimming::CharacterEllipsis);
+    label.TextWrapping(mux::TextWrapping::NoWrap);
+    label.HorizontalAlignment(mux::HorizontalAlignment::Left);
+    label.VerticalAlignment(mux::VerticalAlignment::Center);
+    muxc::Canvas::SetZIndex(pill, 2);  // over Dia's field: the site's own button
+    muxc::Canvas::SetZIndex(label, 3);
+    for (mux::FrameworkElement el : {pill.as<mux::FrameworkElement>(), label.as<mux::FrameworkElement>()}) {
+        muxc::Grid::SetColumnSpan(el, cols);
+        muxc::Grid::SetRowSpan(el, rows);
+        bar.Children().Append(el);
+    }
+    b.pill = winrt::make_weak(pill);
+    b.label = winrt::make_weak(label);
+    // The empty-tab pill: hover and click (opens the command bar, as Ctrl+L does).
+    auto onPill = [](wf::IInspectable const& sender, bool on) {
+        auto p = sender.try_as<muxc::Border>();
+        for (auto& [h, x] : t_arcWin)
+            if (x.pill.get() == p) x.hover = on;
+        LayoutArcWinSafe([p](const ArcWinBar& x) { return x.pill.get() == p; });
+    };
+    pill.PointerEntered([onPill](wf::IInspectable const& s, auto&&) { onPill(s, true); });
+    pill.PointerExited([onPill](wf::IInspectable const& s, auto&&) { onPill(s, false); });
+    pill.Tapped([](auto&&, auto&&) { OpenCommandBar(); });
+    bar.SizeChanged([](wf::IInspectable const& sender, auto&&) {
+        auto g = sender.try_as<muxc::Grid>();
+        LayoutArcWinSafe([g](const ArcWinBar& x) { return x.toolbar.get() == g; });
+    });
+}
+
+// --- The sidebar toggle: Dia's own (only Dia's own buttons take clicks inside Dia's window-drag areas,
+// so it's moved, not copied). With the sidebar open it sits in the sidebar header right after Dia's
+// logo, as in Arc; with the sidebar closed, at the left of the strip, before back / forward / reload.
+struct ArcWinHeader {
+    winrt::weak_ref<muxc::Grid> header;        // Dia's WindowDragHeader
+    winrt::weak_ref<muxc::StackPanel> panel;   // ours, after the logo: holds the toggle
+};
+static thread_local std::vector<ArcWinHeader> t_arcWinHeaders;
+
+static void PutBackArcWinHeaders() {
+    for (auto& s : t_arcWinHeaders) {
+        auto header = s.header.get();
+        auto panel = s.panel.get();
+        if (!header || !panel) continue;
+        uint32_t i;
+        if (header.Children().IndexOf(panel, i)) header.Children().RemoveAt(i);
+    }
+    t_arcWinHeaders.clear();
+}
+
+static void UpdateArcWinHeaders() {
+    for (auto h : FindNodes(L"WindowDragHeader")) {
+        auto header = Obj<muxc::Grid>(h);
+        if (!header) continue;
+        auto logo = FindByName(header, L"AppMenuButton");
+        if (!logo) continue;
+        ArcWinHeader* s = nullptr;
+        for (auto& x : t_arcWinHeaders)
+            if (x.header.get() == header) s = &x;
+        if (!s) {
+            muxc::StackPanel p;
+            p.Name(L"diatweaksArcWinHeaderLeft");
+            p.Orientation(muxc::Orientation::Horizontal);
+            p.HorizontalAlignment(mux::HorizontalAlignment::Left);
+            p.VerticalAlignment(mux::VerticalAlignment::Center);
+            muxc::Grid::SetColumn(p, 0);
+            muxc::Grid::SetColumnSpan(p, (std::max)(1, (int)header.ColumnDefinitions().Size()));
+            muxc::Grid::SetRow(p, muxc::Grid::GetRow(logo));
+            header.Children().Append(p);
+            t_arcWinHeaders.push_back({winrt::make_weak(header), winrt::make_weak(p)});
+            s = &t_arcWinHeaders.back();
+        }
+        auto panel = s->panel.get();
+        if (!panel) continue;
+        // Right after the logo (Dia draws it 8.8 px in, 32 px wide).
+        double x = 40;
+        try {
+            if (logo.ActualWidth() > 0) x = logo.TransformToVisual(header).TransformPoint({0, 0}).X + logo.ActualWidth();
+        } catch (...) {
+        }
+        if (std::abs(panel.Margin().Left - x) > 0.5) panel.Margin({x, 0, 0, 0});
+    }
+    t_arcWinHeaders.erase(std::remove_if(t_arcWinHeaders.begin(), t_arcWinHeaders.end(),
+                                         [](const ArcWinHeader& x) { return !x.header.get() || !x.panel.get(); }),
+                          t_arcWinHeaders.end());
+    // Each window's toggle (moved into its strip with the tab's other controls): to the header while the
+    // sidebar is open there, else first in the strip.
+    for (auto& [gh, b] : t_arcWin) {
+        auto bar = b.toolbar.get();
+        if (!bar) continue;
+        mux::FrameworkElement toggle{nullptr};
+        for (auto& m : b.st.moved)
+            if (auto el = m.el.get().try_as<mux::FrameworkElement>(); el && el.Name() == L"SidebarToggleButton") toggle = el;
+        if (!toggle) continue;
+        muxc::Panel want = FindByName(bar, L"diatweaksArcWinLeft").try_as<muxc::Panel>();
+        if (SidebarDocked(bar.XamlRoot()))
+            for (auto& s : t_arcWinHeaders)
+                if (auto p = s.panel.get(); p && p.XamlRoot() == bar.XamlRoot() && ShownOnScreen(p)) want = p;
+        if (!want) continue;
+        auto cur = muxm::VisualTreeHelper::GetParent(toggle).try_as<muxc::Panel>();
+        if (cur == want) continue;
+        if (cur) {
+            uint32_t i;
+            if (cur.Children().IndexOf(toggle, i)) cur.Children().RemoveAt(i);
+        }
+        want.Children().InsertAt(0, toggle);
+    }
+}
+
+// The strip over the selected tab's toolbar: same spot and size.
+static void PlaceArcWinStrip(ArcWinBar& b) {
+    auto bar = b.toolbar.get();
+    auto group = b.group.get();
+    auto src = b.st.source.get();
+    if (!bar || !group || !src || src.ActualWidth() <= 0) return;
+    auto at = src.TransformToVisual(group).TransformPoint({0, 0});
+    auto m = bar.Margin();
+    if (std::abs(m.Left - at.X) > 0.5 || std::abs(m.Top - at.Y) > 0.5) bar.Margin({at.X, at.Y, 0, 0});
+    if (std::abs(bar.Width() - src.ActualWidth()) > 0.5 || std::isnan(bar.Width())) bar.Width(src.ActualWidth());
+    if (std::abs(bar.Height() - src.ActualHeight()) > 0.5 || std::isnan(bar.Height())) bar.Height(src.ActualHeight());
+}
+
+static void ArcWinOff(ArcWinBar& b) {
+    PutBackArcWin(b);
+    ReturnMoved(b.st);
+    if (auto group = b.group.get())
+        if (auto bar = b.toolbar.get()) {
+            uint32_t i;
+            if (group.Children().IndexOf(bar, i)) group.Children().RemoveAt(i);
+        }
+}
+
+// The pill lights up only while the pointer is over the site itself, not over ☆ / ⋯ beside it (Dia's
+// field, which gets the pointer events, spans all three).
+static bool OverPill(const muxc::Border& pill, mux::Input::PointerRoutedEventArgs const& e) {
+    if (!pill || pill.Visibility() != mux::Visibility::Visible) return false;
+    auto p = e.GetCurrentPoint(pill).Position();
+    return p.X >= 0 && p.Y >= 0 && p.X < pill.ActualWidth() && p.Y < pill.ActualHeight();
+}
+
+static void HookArcWinHover(const mux::FrameworkElement& host) {
+    static thread_local std::set<void*> hooked;
+    if (!host || !hooked.insert(winrt::get_abi(host)).second) return;
+    auto update = [](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e, bool left) {
+        for (auto d = sender.try_as<mux::DependencyObject>(); d; d = muxm::VisualTreeHelper::GetParent(d))
+            if (auto g = d.try_as<muxc::Grid>(); g && g.Name() == L"diatweaksArcWinStrip") {
+                bool changed = false;
+                for (auto& [h, x] : t_arcWin)
+                    if (x.toolbar.get() == g) {
+                        bool on = !left && OverPill(x.pill.get(), e);
+                        if (on != x.hover) x.hover = on, changed = true;
+                    }
+                if (changed) LayoutArcWinSafe([g](const ArcWinBar& x) { return x.toolbar.get() == g; });
+                return;
+            }
+    };
+    host.PointerEntered([update](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) { update(s, e, false); });
+    host.PointerMoved([update](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) { update(s, e, false); });
+    host.PointerExited([update](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) { update(s, e, true); });
+}
+
+static bool NewTabRelayActive();
+
+// Tabs' own toolbars other than the one under the strip: Dia shows a new tab's toolbar the moment it
+// makes the tab; it stays invisible, so the strip is all you see. (Not in split view: the other panes
+// keep theirs.) (toolbar, Dia's opacity)
+static thread_local std::vector<std::pair<winrt::weak_ref<mux::UIElement>, double>> t_arcWinHiddenBars;
+
+static void ShowArcWinBar(const mux::UIElement& el) {
+    for (auto it = t_arcWinHiddenBars.begin(); it != t_arcWinHiddenBars.end(); ++it)
+        if (it->first.get() == el) {
+            el.Opacity(it->second);
+            t_arcWinHiddenBars.erase(it);
+            return;
+        }
+}
+
+static void HideOtherArcWinBars() {
+    bool split = Ui_State(L"split");
+    for (auto h : FindNodes(L"NavigationBarContent")) {
+        auto nb = Obj<mux::FrameworkElement>(h);
+        if (!nb) continue;
+        bool under = false;
+        for (auto& [gh, b] : t_arcWin)
+            if (b.st.source.get() == nb) under = true;
+        bool hide = ArcWindowsOn() && !split && !under && ShownOnScreen(nb);
+        bool hidden = false;
+        for (auto& [w, o] : t_arcWinHiddenBars)
+            if (w.get() == nb) hidden = true;
+        if (hide && !hidden) t_arcWinHiddenBars.push_back({winrt::make_weak(nb.as<mux::UIElement>()), nb.Opacity()}), nb.Opacity(0);
+        else if (!hide && hidden) ShowArcWinBar(nb);
+    }
+    t_arcWinHiddenBars.erase(std::remove_if(t_arcWinHiddenBars.begin(), t_arcWinHiddenBars.end(),
+                                            [](auto& x) { return !x.first.get(); }),
+                             t_arcWinHiddenBars.end());
+}
+
+static void UpdateArcWindows() {
+    if (!ArcWindowsOn()) {
+        if (t_arcWin.empty() && t_arcWinHeaders.empty() && t_arcWinHiddenBars.empty()) return;
+        for (auto& [w, o] : t_arcWinHiddenBars)
+            if (auto el = w.get()) el.Opacity(o);
+        t_arcWinHiddenBars.clear();
+        for (auto& [h, b] : t_arcWin) ArcWinOff(b);
+        t_arcWin.clear();
+        PutBackArcWinHeaders();
+        Log("Arc (Windows) URL bar: off");
+        return;
+    }
+    for (auto h : FindNodes(L"ContentGroup")) {
+        auto group = Obj<muxc::Grid>(h);
+        if (!group) continue;
+        auto it = t_arcWin.find(h);
+        if (it == t_arcWin.end() || !it->second.toolbar.get()) {
+            if (t_arcWin.empty()) Log("Arc (Windows) URL bar: on");
+            BuildArcWin(t_arcWin[h], group);
+            it = t_arcWin.find(h);
+        }
+        auto& b = it->second;
+        auto bar = b.toolbar.get();
+        if (!bar) continue;
+        // A tab (or split pane) was selected: the last one gets its controls back and this one's move
+        // in, before the frame is drawn, so the strip itself never changes. While Ctrl+T's bar is opening
+        // a URL in a new tab (Floating new tab bar), the strip keeps the current tab's controls until the
+        // new tab has left its New Tab page: as in Arc, only the address then changes.
+        if (!NewTabRelayActive()) AdoptActiveTab(b.st, false);
+        if (b.st.swapped) {
+            b.st.swapped = false;
+            auto right = FindByName(bar, L"diatweaksArcWinRight").try_as<muxc::Panel>();
+            auto src = b.st.source.get();
+            if (auto ext = src ? FindByName(src, L"PinnedExtensionsHost") : nullptr; ext && right)
+                if (auto stack = muxm::VisualTreeHelper::GetParent(ext).try_as<mux::FrameworkElement>())
+                    MoveInto(b.st, stack, right, stack.Margin(), mux::HorizontalAlignment::Right);
+            HookArcWinHover(FindByName(bar, L"AssistantBarHost"));
+            PlaceArcWinStrip(b);
+            bar.UpdateLayout();
+        }
+        PlaceArcWinStrip(b);
+        auto host = FindByName(bar, L"AssistantBarHost");
+        if (b.hover && !(b.pill.get() && PointerInside(b.pill.get()))) b.hover = false;  // events can miss a leave
+        LayoutArcWin(b);
+    }
+    for (auto it = t_arcWin.begin(); it != t_arcWin.end();)
+        it = it->second.group.get() ? std::next(it) : t_arcWin.erase(it);
+    HideOtherArcWinBars();
+    UpdateArcWinHeaders();
 }
 
 // ---------------------------------------------------------------- Arc: New Tab page = the command bar
@@ -3090,6 +3728,11 @@ static thread_local int t_unhideFrames = 0;
 static thread_local winrt::event_token t_unhideToken{};
 
 // Shows the New Tab page again once the new tab has moved on to the URL (or after ~3 s).
+static thread_local std::wstring t_relayText;  // what the relay is opening (for the strip's address)
+// From Enter in the bar until the new tab has left its New Tab page (or the relay gave up).
+static bool NewTabRelayActive() { return !t_relayText.empty() || t_submitToken.value != 0 || t_hiddenPage.get() != nullptr; }
+static std::wstring RelayText() { return t_relayText; }
+
 static void UnhidePageLater() {
     t_unhideFrames = 180;
     if (t_unhideToken) return;
@@ -3101,6 +3744,8 @@ static void UnhidePageLater() {
             t_hiddenPage = nullptr;
             muxm::CompositionTarget::Rendering(t_unhideToken);
             t_unhideToken = {};
+            t_relayText.clear();  // the new tab has its page: the strip takes its controls now
+            ScheduleArcAdopt();
         }
     });
 }
@@ -3190,6 +3835,8 @@ static void SubmitInNewTab() {
 // Opens a real new tab and submits the text in its box (also used by Peek's "open as tab").
 static void OpenTextInNewTab(const std::wstring& text) {
     t_pendingQuery = text;
+    t_relayText = text;
+    if (ArcWindowsOn()) LayoutArcWinSafe([](const ArcWinBar&) { return true; });  // the new address, now
     t_passCtrlT = true;
     bool ctrlHeld = GetAsyncKeyState(VK_CONTROL) & 0x8000;
     if (ctrlHeld) SendKeys({{'T', true}, {'T', false}});
@@ -3258,6 +3905,7 @@ static void OpenTextInNewTab(const std::wstring& text) {
             t_passCtrlT = false;
             t_enterIn = -1;
             if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // gave up: never leave it hidden
+            if (!t_hiddenPage.get() && !t_unhideToken) t_relayText.clear(), ScheduleArcAdopt();
         }
     });
 }
@@ -3344,6 +3992,10 @@ struct CaptionState {
     std::vector<winrt::Windows::Graphics::RectInt32> diaCaption;
     bool captionTrimmed = false;
     int pageLeft = 0;
+    // Arc (Windows): the strip's empty space is a window-drag (caption) area, as in Arc's title bar.
+    // Dia's own caption areas (kept, put back when off) and the full set we applied.
+    std::vector<winrt::Windows::Graphics::RectInt32> arcDia, arcApplied;
+    bool arcOn = false;
 };
 static thread_local std::map<InstanceHandle, CaptionState> t_caption;
 static const mui::NonClientRegionKind kButtonKinds[] = {
@@ -3718,7 +4370,7 @@ bool Ui_PeekFixedSize(HWND w) {
 }
 
 static void UpdateHiddenToolbar() {
-    bool hide = Engine_TweakOn(L"hideToolbar") || Engine_TweakOn(L"arcUrlBar");
+    bool hide = Engine_TweakOn(L"hideToolbar") || ArcSidebarOn();
     bool show = (Engine_TweakOn(L"hideToolbar") && Engine_Hover()) ||
                 (Engine_TweakOn(L"showToolbarWithSidebar") && Ui_State(L"sidebarOpen")) ||
                 (Engine_TweakOn(L"showToolbarOnNewTab") && Ui_State(L"newTab"));
@@ -3872,6 +4524,77 @@ static HWND TopWindowFor(const mux::XamlRoot& root) {
     return ctx.best;
 }
 
+// The strip's empty space, in window pixels: the strip minus its left buttons, the centered group and
+// its right buttons. That's what drags the window, as in Arc's title bar.
+static std::vector<winrt::Windows::Graphics::RectInt32> ArcWinDragRects(const mux::XamlRoot& root) {
+    std::vector<winrt::Windows::Graphics::RectInt32> out;
+    if (!ArcWindowsOn() || !root) return out;
+    double sc = root.RasterizationScale();
+    for (auto& [h, b] : t_arcWin) {
+        auto bar = b.toolbar.get();
+        if (!bar || bar.XamlRoot() != root || !ShownOnScreen(bar) || bar.ActualWidth() <= 0) continue;
+        auto at = bar.TransformToVisual(nullptr).TransformPoint({0, 0});
+        double top = at.Y, bottom = at.Y + bar.ActualHeight();
+        if (bottom <= 0) continue;  // slid away (Hide toolbar)
+        std::vector<std::pair<double, double>> taken;  // x ranges with buttons
+        auto take = [&](const mux::FrameworkElement& fe) {
+            if (!fe || fe.Visibility() != mux::Visibility::Visible || fe.ActualWidth() <= 0) return;
+            double x = fe.TransformToVisual(nullptr).TransformPoint({0, 0}).X;
+            taken.push_back({x, x + fe.ActualWidth()});
+        };
+        for (auto name : {L"diatweaksArcWinLeft", L"diatweaksArcWinRight"})
+            if (auto p = FindByName(bar, name).try_as<muxc::Panel>())
+                for (auto const& c : p.Children()) take(c.try_as<mux::FrameworkElement>());
+        take(b.pill.get());
+        for (auto& [w, tr] : b.moved) take(w.get());
+        std::sort(taken.begin(), taken.end());
+        double x = at.X, end = at.X + bar.ActualWidth();
+        auto add = [&](double l, double r) {
+            if (r - l < 2) return;
+            out.push_back({(int)std::ceil(l * sc), (int)std::floor((std::max)(0.0, top) * sc), (int)std::floor((r - l) * sc),
+                           (int)std::floor((bottom - (std::max)(0.0, top)) * sc)});
+        };
+        for (auto& [l, r] : taken) {
+            if (l > x) add(x, (std::min)(l, end));
+            x = (std::max)(x, r);
+        }
+        if (x < end) add(x, end);
+    }
+    return out;
+}
+
+static void UpdateArcWinCaption(CaptionState& c, const mux::XamlRoot& root) {
+    if (!c.src) return;
+    using R = winrt::Windows::Graphics::RectInt32;
+    auto same = [](const std::vector<R>& a, const std::vector<R>& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t i = 0; i < a.size(); i++)
+            if (a[i].X != b[i].X || a[i].Y != b[i].Y || a[i].Width != b[i].Width || a[i].Height != b[i].Height) return false;
+        return true;
+    };
+    auto curView = c.src.GetRegionRects(mui::NonClientRegionKind::Caption);
+    std::vector<R> cur(curView.begin(), curView.end());
+    auto mine = ArcWinDragRects(root);
+    if (mine.empty()) {
+        if (c.arcOn) {  // off (or the toolbar slid away): Dia's own areas back
+            c.self = true;
+            c.src.SetRegionRects(mui::NonClientRegionKind::Caption, c.arcDia);
+            c.self = false;
+            c.arcOn = false;
+        }
+        return;
+    }
+    if (!c.arcOn || !same(cur, c.arcApplied)) c.arcDia = cur;  // Dia set new ones (or first time)
+    std::vector<R> want = c.arcDia;
+    want.insert(want.end(), mine.begin(), mine.end());
+    if (c.arcOn && same(want, cur)) return;
+    c.self = true;
+    c.src.SetRegionRects(mui::NonClientRegionKind::Caption, want);
+    c.self = false;
+    c.arcApplied = want;
+    c.arcOn = true;
+}
+
 // While a window's toolbar is hidden, its old drag areas over the page are trimmed away.
 static void UpdateCaptionTrim() {
     for (auto& [h, c] : t_caption) {
@@ -3898,6 +4621,7 @@ static void UpdateCaptionTrim() {
         } else
             UntrimCaption(c);
         if (top) TrimSink(top, hiddenBar, c.pageLeft);
+        if (!hiddenBar) UpdateArcWinCaption(c, root);
     }
 }
 
@@ -4005,36 +4729,48 @@ bool Ui_Tick() {
         Log("ui running on thread %lu (%zu elements)", GetCurrentThreadId(), n);
     }
     bool changed = false;
+    const char* stage = "states";  // which step failed, for the log
     try {
         if (tick % 2 == 0) changed = UpdateStates();
+        stage = "arc";
         UpdateArcBar();
+        stage = "arcWindows";
+        UpdateArcWindows();
+        stage = "startPages";
         StyleStartPages();
+        stage = "hiddenToolbar";
         UpdateHiddenToolbar();
-        if (Engine_TweakOn(L"floatingNewTab")) {
-            InstallArcKeys();
-            if (!Engine_TweakOn(L"arcUrlBar")) HookCommandBarPopovers();  // (Arc mode hooks them already)
-        }
+        stage = "commandBar";
+        if (Engine_TweakOn(L"floatingNewTab")) InstallArcKeys();
+        if ((Engine_TweakOn(L"floatingNewTab") || ArcWindowsOn()) && !ArcSidebarOn())
+            HookCommandBarPopovers();  // (Arc mode hooks them already)
+        stage = "newTab";
         UpdateNewTabMode();
+        stage = "peek";
         Peek_Tick();
+        stage = "hoverCards";
         UpdateHoverCards();
         if (tick % 3 == 0) {
+            stage = "look";
             UpdateWindowMaterial();
             UpdateToolbarLook();
             UpdateAddressField();
             UpdateProfileEmoji();
             UpdateSquareCorners();
         }
+        stage = "downloads";
         UpdateDownloadsPopup();
         if (tick % 5 == 0) {
+            stage = "settings";
             ScanForSettings();
             SyncToggles();
             SyncUpdates();
             RunProbe();
         }
     } catch (winrt::hresult_error const& e) {
-        Log("ui tick error 0x%08lx", (unsigned long)e.code());
+        Log("ui tick error 0x%08lx (%s)", (unsigned long)e.code(), stage);
     } catch (...) {
-        Log("ui tick error");
+        Log("ui tick error (%s)", stage);
     }
     return changed;
 }

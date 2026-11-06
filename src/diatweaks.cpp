@@ -1064,6 +1064,16 @@ static std::vector<std::string> MergeConf(const std::vector<std::string>& fresh,
         if (header(l, key, rest)) state[key] = rest;
         else if (!key.empty() && isValue(l)) value[key] = l;
     }
+    // Renamed tweaks: your choice carries over to the one that replaced it. Toolbar color = Sidebar became
+    // Toolbar in the title bar (on); Adaptive (or the tweak off) leaves it off.
+    if (state.count("toolbarColor") && !state.count("titleBar")) {
+        std::string v = value.count("toolbarColor") ? value["toolbarColor"] : "value: sidebar";
+        v.erase(0, v.find(':') + 1);
+        v.erase(0, v.find_first_not_of(" \t"));
+        v.erase(v.find_last_not_of(" \t") + 1);
+        bool sidebar = state["toolbarColor"].rfind("on", 0) == 0 && v != "off";
+        state["titleBar"] = sidebar ? "on" : "off";
+    }
     std::vector<std::string> out;
     key.clear();
     for (auto& l : fresh) {

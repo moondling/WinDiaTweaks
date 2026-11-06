@@ -1777,11 +1777,16 @@ static thread_local std::vector<SidebarPageClip> t_sidebarPageClips;
 // Only the corners: where the page sits (its distance from the window's edges) is Dia's, or Edge-to-edge's.
 static constexpr float kPageClipTop = 7;
 
+static bool ArcSidebarOn();
+
 static void UpdateSidebarPageCorners() {
     using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
-    // Only while the toolbar is up in the title bar: in split view, or with the Arc URL bar or Hide toolbar,
-    // the toolbar stays on the page's card and rounded corners under it would leave notches.
-    if (!TitleBarMoveOn() || Engine_TweakOn(L"squareCorners")) {
+    // Only while no toolbar sits on the page's card: the toolbar up in the title bar, or the Arc URL bar in
+    // the sidebar, which hides the top toolbar (except in split view, where each pane keeps one for its
+    // close button). With Arc (Windows), Hide toolbar or split view the toolbar stays on the card, and
+    // rounded corners under it would leave notches.
+    bool exposed = TitleBarMoveOn() || (TitleBarOn() && ArcSidebarOn() && !Ui_State(L"split"));
+    if (!exposed || Engine_TweakOn(L"squareCorners")) {
         for (auto& state : t_sidebarPageClips) {
             if (state.element.get() && state.visual.Clip() == state.clip) {
                 state.clip.TopLeftRadius(state.topLeft);

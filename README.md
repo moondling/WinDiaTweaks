@@ -18,6 +18,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 
 - **None**: Dia as it comes (the default).
 - **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic.
+- **Arc (Windows)**: like Arc for Windows. The toolbar stays, in the sidebar's color, with just the site centered in it; otherwise the same as Arc.
 - **Custom**: your own mix. Changing any tweak switches to it.
 
 | Tweak | Does |
@@ -30,7 +31,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
 | Show toolbar on new tab pages | With the toolbar hidden, keeps it on new tab pages |
 | Toolbar color ✨ | Adaptive (follows the site, Dia's default) or Sidebar (same color or window material as the sidebar) |
-| Arc URL bar ✨ | Moves the sidebar button, back, forward, reload and the address into the top of the sidebar, like Arc. The address shows just the site; its buttons appear on hover |
+| Address bar ✨ | **Toolbar (Dia)**: Dia's own toolbar. **Sidebar (Arc for Mac)**: moves the sidebar button, back, forward, reload and the address into the top of the sidebar; the address shows just the site, its buttons appear on hover. **Centered (Arc for Windows)**: one fixed toolbar in the sidebar's color with just the site centered between its ☆ and ⋯ buttons, no loading bar, the sidebar button right after the Dia logo; clicking the site opens the command bar in the middle of the window, and the toolbar's empty space drags the window |
 | Floating new tab bar ✨ | Ctrl+T shows the address bar floating over the page instead of a New Tab page; Enter opens the result in a new tab |
 | **Toolbar items** | |
 | Always show address field | Keeps the address field's background and buttons visible, not just on hover |

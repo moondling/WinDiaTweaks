@@ -224,9 +224,16 @@ static bool StrMatch(const Cond& c, const std::wstring& s, bool typeField) {
 // Live window state that rules can depend on (state=<name>). Updated on the UI thread by the timer.
 static bool g_hoverTop = false;
 
-static bool CondHolds(const Cond& c, InstanceHandle h, const Node& n) {
+static std::wstring TweakValueOf(const std::wstring& key) {
+    for (auto& t : g_tweaks)
+        if (t.key == key) return t.value;
+    return {};
+}
+
+static bool CondHolds(const Cond& c, const std::wstring& tweak, InstanceHandle h, const Node& n) {
     if (c.field == L"type") return StrMatch(c, n.type, true);
     if (c.field == L"tweak") return TweakOn(c.value) != c.negate;
+    if (c.field == L"value") return (TweakValueOf(tweak) == c.value) != c.negate;  // the rule's own tweak
     if (c.field == L"state") {
         bool on;
         if (c.value == L"hover") on = g_hoverTop;
@@ -277,7 +284,7 @@ static bool CondHolds(const Cond& c, InstanceHandle h, const Node& n) {
 
 static bool RuleMatches(const Rule& r, InstanceHandle h, const Node& n) {
     for (auto& c : r.conds)
-        if (!CondHolds(c, h, n)) return false;
+        if (!CondHolds(c, r.tweak, h, n)) return false;
     return true;
 }
 

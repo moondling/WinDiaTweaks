@@ -30,7 +30,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window |
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
 | Show toolbar on new tab pages | With the toolbar hidden, keeps it on new tab pages |
-| Toolbar color ✨ | Adaptive (follows the site, Dia's default) or Sidebar (same color or window material as the sidebar) |
+| Toolbar in the title bar ✨ | Moves the toolbar into the window's top row, level with the window buttons, in the sidebar's colors (its color or window material). The page and side panels start below it, so it stays put when a side panel opens; in split view the selected pane's toolbar is the one up there. Off: Dia's own toolbar in the site's color |
 | Address bar ✨ | **Toolbar (Dia)**: Dia's own toolbar. **Sidebar (Arc for Mac)**: moves the sidebar button, back, forward, reload and the address into the top of the sidebar; the address shows just the site, its buttons appear on hover. **Centered (Arc for Windows)**: one fixed toolbar in the sidebar's color with just the site centered between its ☆ and ⋯ buttons, no loading bar, the sidebar button right after the Dia logo; clicking the site opens the command bar in the middle of the window, and the toolbar's empty space drags the window |
 | Floating new tab bar ✨ | Ctrl+T shows the address bar floating over the page instead of a New Tab page; Enter opens the result in a new tab |
 | **Toolbar items** | |

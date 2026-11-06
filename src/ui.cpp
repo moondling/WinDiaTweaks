@@ -5,6 +5,9 @@
 // Runs on Dia's UI threads only (called from the engine's timer and from WinUI events).
 
 #include <unknwn.h>
+#include <windowsx.h>  // GET_X_LPARAM (the caption sink's drag spans)
+#undef CopyRgn         // (a windowsx.h macro; ui.cpp has a function of that name)
+#include <commctrl.h>  // SetWindowSubclass
 // windows.h maps GetCurrentTime to GetTickCount (a Win16 leftover), which clashes with WinUI's
 // Storyboard::GetCurrentTime.
 #undef GetCurrentTime
@@ -1304,6 +1307,13 @@ static bool UpdateStates() {
             if (auto fe = Obj<mux::FrameworkElement>(h); fe && ShownOnScreen(fe)) bars++;
         now[L"split"] = bars > 1;
     }
+    // Dia's tab layout set to the top bar (Settings > Tabs): the tab strip (TabStripContentHost) sits in
+    // the window's top row, the one Toolbar in the title bar moves the toolbar into. That patch is for the
+    // sidebar layout and stands aside while this holds (TitleBarOn, and state!=topTabs in its rules).
+    now[L"topTabs"] = false;
+    for (auto h : FindNodes(L"TabStripContentHost"))
+        if (auto fe = Obj<mux::FrameworkElement>(h); fe && ShownOnScreen(fe)) now[L"topTabs"] = true;
+    if (now[L"topTabs"] != Ui_State(L"topTabs")) Log("tab layout: %s", now[L"topTabs"] ? "top bar" : "sidebar");
     bool changed = now != t_states;
     t_states = now;
     return changed;
@@ -1400,9 +1410,10 @@ static void UpdateWindowMaterial() {
                          t_material.end());
 }
 
-// --- Toolbar color: Dia paints the toolbar strip (and tints its icons and the window buttons)
-// in the site's color. With this on, the strip is see-through, so the sidebar's color or the window
-// material behind it shows, and icons and text take the sidebar's text color.
+// --- Sidebar colors for the toolbar (part of Toolbar in the title bar): Dia paints the toolbar strip
+// (and tints its icons and the window buttons) in the site's color. With this on, the strip is
+// see-through, so the sidebar's color or the window material behind it shows, and icons and text take
+// the sidebar's text color.
 struct LookSaved {
     winrt::weak_ref<mux::DependencyObject> el;
     mux::DependencyProperty dp{nullptr};
@@ -1415,11 +1426,19 @@ static thread_local muxm::Brush t_lookText{nullptr};
 static thread_local bool t_lookPending = false;
 static thread_local winrt::event_token t_lookToken{};
 
-// On with "sidebar"; "off" (Adaptive) also covers `diatweaks set toolbarColor off`.
-// Arc (Windows) URL bar placement turns it on too: Arc's toolbar is the sidebar's color.
+// Toolbar in the title bar: the toolbar comes in the sidebar's colors (with Dia's site colors up there it
+// clashed, and the page's rounded top corners come with these). Off: Dia's own, adaptive colors.
+// Only with Dia's sidebar tab layout: with tabs in the top bar the toolbar would cover them (topTabs in
+// UpdateStates), so the whole patch stands aside, colors too.
+static bool TitleBarOn() { return Engine_TweakOn(L"titleBar") && !Ui_State(L"topTabs"); }
+// The move itself: the Arc URL bar (either placement) and Hide toolbar lay the toolbar out themselves and
+// take priority over it; the colors stay with them.
+static bool TitleBarMoveOn() {
+    return TitleBarOn() && !Engine_TweakOn(L"arcUrlBar") && !Engine_TweakOn(L"hideToolbar");
+}
+// Arc (Windows) URL bar placement turns the colors on too: Arc's toolbar is the sidebar's color.
 static bool ToolbarSidebar() {
-    return (Engine_TweakOn(L"toolbarColor") && Engine_TweakValue(L"toolbarColor") != L"off") ||
-           (Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") == L"windows");
+    return TitleBarOn() || (Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") == L"windows");
 }
 
 static muxm::Brush LookClear() {
@@ -1741,12 +1760,75 @@ static void LookWalk(const mux::DependencyObject& d, int depth) {
     for (int i = 0; i < n; i++) LookWalk(muxm::VisualTreeHelper::GetChild(d, i), depth + 1);
 }
 
+// The page is a cross-compositor surface. Its own RectangleClip controls visible
+// corners; a geometric clip on the outer XAML host does not round that surface.
+struct SidebarPageClip {
+    winrt::weak_ref<mux::FrameworkElement> element;
+    winrt::Microsoft::UI::Composition::Visual visual{nullptr};
+    winrt::Microsoft::UI::Composition::RectangleClip clip{nullptr};
+    winrt::Windows::Foundation::Numerics::float2 topLeft{}, topRight{};
+};
+static thread_local std::vector<SidebarPageClip> t_sidebarPageClips;
+
+// The page's top corners, once its toolbar is up in the title bar: rounded like the card and its outline.
+// They come from a clip on Dia's native web surface, drawn by another process, and that clip's edge is
+// never smoothed (in Dia too, at the bottom). Nothing XAML can draw covers it exactly: the window behind
+// is a system backdrop material, not a color to match.
+// Only the corners: where the page sits (its distance from the window's edges) is Dia's, or Edge-to-edge's.
+static constexpr float kPageClipTop = 7;
+
+static void UpdateSidebarPageCorners() {
+    using winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview;
+    if (!TitleBarOn() || Engine_TweakOn(L"squareCorners")) {
+        for (auto& state : t_sidebarPageClips) {
+            if (state.element.get() && state.visual.Clip() == state.clip) {
+                state.clip.TopLeftRadius(state.topLeft);
+                state.clip.TopRightRadius(state.topRight);
+            }
+        }
+        t_sidebarPageClips.clear();
+        return;
+    }
+    t_sidebarPageClips.erase(std::remove_if(t_sidebarPageClips.begin(), t_sidebarPageClips.end(),
+        [](const SidebarPageClip& state) { return !state.element.get(); }), t_sidebarPageClips.end());
+    for (auto handle : FindNodes(L"VariantHost")) {
+        auto element = Obj<mux::FrameworkElement>(handle);
+        if (!element) continue;
+        auto page = FindVisual(element, [](const mux::DependencyObject& node) {
+            return winrt::get_class_name(node) == L"NativeAppComponent.WindowlessContentsControl";
+        }).try_as<mux::FrameworkElement>();
+        if (!page) continue;
+        auto visual = ElementCompositionPreview::GetElementChildVisual(page);
+        if (!visual) continue;
+        auto clip = visual.Clip().try_as<winrt::Microsoft::UI::Composition::RectangleClip>();
+        if (!clip) continue;  // wait for Dia to attach the native surface
+        if (std::any_of(t_sidebarPageClips.begin(), t_sidebarPageClips.end(),
+            [&](const SidebarPageClip& state) { return state.clip == clip; })) continue;
+        SidebarPageClip state;
+        state.element = winrt::make_weak(page);
+        state.visual = visual;
+        state.clip = clip;
+        state.topLeft = clip.TopLeftRadius();
+        state.topRight = clip.TopRightRadius();
+        // Rounded like the card and its outline (see kPageClipTop).
+        clip.TopLeftRadius({kPageClipTop, kPageClipTop});
+        clip.TopRightRadius({kPageClipTop, kPageClipTop});
+        t_sidebarPageClips.push_back(std::move(state));
+    }
+}
+
+static void UnthemePopovers();
+static void HookCommandBarPopovers(bool place = true);
+
 static void UpdateToolbarLook() {
+    UpdateSidebarPageCorners();
+    if (!TitleBarOn()) UnthemePopovers();
     if (!ToolbarSidebar()) {
         if (!t_look.empty() || !t_palette.empty() || !t_fieldHover.empty() || !t_address.empty())
             LookRestoreAll(), PaletteRestoreAll(), t_lookText = nullptr, Log("toolbar color: adaptive");
         return;
     }
+    if (TitleBarOn()) HookCommandBarPopovers(false);  // new popovers hooked: they take the sidebar's theme (ThemePopover)
     auto text = SidebarTextBrush();
     if (text != t_lookText) {
         bool first = !t_lookText;
@@ -4435,7 +4517,80 @@ static void CheckLiftedBar() {
     if (layout.Visibility() == mux::Visibility::Visible && !SidebarInPopup(layout.XamlRoot())) UnliftCommandBar();
 }
 
+// Toolbar in the title bar: Dia places its address box from where the toolbar sits in the page's pane,
+// but the toolbar now lives in our row above it. With a side panel open the pane is narrower, so the box
+// opened off to one side. Center it under the address field it belongs to instead (Dia's top is kept).
+static void AnchorToTitleBar(const mux::FrameworkElement& layout) {
+    if (!TitleBarMoveOn()) return;
+    auto canvas = muxm::VisualTreeHelper::GetParent(layout).try_as<mux::UIElement>();
+    // A box that just opened isn't measured yet: Dia gives it its width up front, so use that.
+    double width = layout.Width();
+    if (std::isnan(width) || width < 1) width = layout.ActualWidth();
+    if (width < 1) width = layout.DesiredSize().Width;
+    if (!canvas || width < 1) return;
+    for (auto h : FindNodes(L"AssistantBarHost")) {
+        auto host = Obj<mux::FrameworkElement>(h);
+        if (!host || host.XamlRoot() != layout.XamlRoot() || !ShownOnScreen(host) || host.ActualWidth() < 1) continue;
+        bool inTitleBar = false;
+        for (mux::DependencyObject d = host; d && !inTitleBar; d = muxm::VisualTreeHelper::GetParent(d))
+            if (auto fe = d.try_as<mux::FrameworkElement>()) inTitleBar = fe.Name() == L"diatweaksTitleBar";
+        if (!inTitleBar) continue;
+        auto at = host.TransformToVisual(canvas).TransformPoint({0, 0});
+        double left = at.X + host.ActualWidth() / 2 - width / 2;
+        if (auto cfe = canvas.try_as<mux::FrameworkElement>(); cfe && cfe.ActualWidth() > width)
+            left = (std::clamp)(left, 0.0, cfe.ActualWidth() - width);  // stays inside the window
+        if (std::abs(muxc::Canvas::GetLeft(layout) - left) > 0.5) muxc::Canvas::SetLeft(layout, left);
+        return;
+    }
+}
+
+// Toolbar in the title bar (sidebar colors). Dia themes its popovers after the toolbar they open from, which
+// follows the site (a light site gave a light site menu): they take the sidebar's theme instead, as the
+// toolbar does.
+struct PopoverTheme {
+    winrt::weak_ref<mux::FrameworkElement> layout;
+    mux::ElementTheme dia = mux::ElementTheme::Default;
+};
+static thread_local std::map<void*, PopoverTheme> t_popoverThemes;
+
+static void ThemePopover(const mux::FrameworkElement& layout) {
+    void* id = winrt::get_abi(layout);
+    auto it = t_popoverThemes.find(id);
+    if (it != t_popoverThemes.end() && it->second.layout.get() != layout) t_popoverThemes.erase(it), it = t_popoverThemes.end();
+    if (!TitleBarOn()) {
+        if (it != t_popoverThemes.end()) {
+            layout.RequestedTheme(it->second.dia);
+            t_popoverThemes.erase(it);
+        }
+        return;
+    }
+    if (layout.Visibility() != mux::Visibility::Visible) return;  // themed when it next shows
+    // The sidebar's theme, looked up again at most every half second (this runs as the popover moves).
+    static thread_local void* cachedRoot = nullptr;
+    static thread_local double cachedAt = -1e9;
+    static thread_local mux::ElementTheme cached = mux::ElementTheme::Default;
+    auto root = layout.XamlRoot();
+    if (!root) return;
+    if (cachedRoot != winrt::get_abi(root) || NowMs() - cachedAt > 500) {
+        auto sidebar = FindInRoot(L"SidebarBorder", root);
+        if (!sidebar) return;
+        cached = sidebar.ActualTheme();
+        cachedRoot = winrt::get_abi(root);
+        cachedAt = NowMs();
+    }
+    auto want = cached;
+    if (it == t_popoverThemes.end()) it = t_popoverThemes.emplace(id, PopoverTheme{winrt::make_weak(layout), layout.RequestedTheme()}).first;
+    if (layout.RequestedTheme() != want) layout.RequestedTheme(want);
+}
+
+static void UnthemePopovers() {
+    for (auto& [id, t] : t_popoverThemes)
+        if (auto l = t.layout.get()) l.RequestedTheme(t.dia);
+    t_popoverThemes.clear();
+}
+
 static void PlaceCommandBar(const mux::FrameworkElement& layout) {
+    ThemePopover(layout);
     bool lifted = t_lift.popup && t_lift.layout.get() == layout;
     // Closing: leave a lifted card where it is (collapsed, so not shown). Moving it mid-close cuts Dia's
     // closing short, and Dia then never starts the page's loading animation in the pill.
@@ -4450,7 +4605,8 @@ static void PlaceCommandBar(const mux::FrameworkElement& layout) {
     bool arc = ArcSidebarOn();
     if (!floating && !arc) {
         if (lifted) UnliftCommandBar();
-        return UnplaceCommandBar(layout, bar);
+        UnplaceCommandBar(layout, bar);
+        return AnchorToTitleBar(layout);
     }
     auto pill = ArcPill(layout.XamlRoot());
     // Arc mode with the sidebar floating out over the page: anchored over the pill, above the sidebar.
@@ -4515,11 +4671,14 @@ static void PlaceCommandBar(const mux::FrameworkElement& layout) {
     layout.HorizontalAlignment(mux::HorizontalAlignment::Left);
 }
 
-static void HookCommandBarPopovers() {
+// place: also place every popover now (else only newly found ones are hooked and placed; after that they're
+// placed when Dia moves, sizes, shows or hides them).
+static void HookCommandBarPopovers(bool place) {
     for (auto h : FindNodes(L"PopoverLayoutRoot")) {
         auto layout = Obj<mux::FrameworkElement>(h);
         if (!layout) continue;
-        if (!t_popoverHooked.count(h)) {
+        bool fresh = !t_popoverHooked.count(h);
+        if (fresh) {
             t_popoverHooked.insert(h);
             auto weak = winrt::make_weak(layout);
             auto again = [weak](auto&&...) {
@@ -4533,7 +4692,7 @@ static void HookCommandBarPopovers() {
             layout.RegisterPropertyChangedCallback(mux::UIElement::VisibilityProperty(), again);
             layout.SizeChanged(again);
         }
-        PlaceCommandBar(layout);
+        if (place || fresh) PlaceCommandBar(layout);
     }
 }
 
@@ -4581,6 +4740,24 @@ static void ScheduleArcAdopt() {
     });
 }
 
+// Toolbar in the title bar: an address box that just opened is centered under its field before its first
+// frame is drawn (waiting for the next pass showed it at Dia's spot first, then moved it).
+static thread_local bool t_anchorPending = false;
+static thread_local winrt::event_token t_anchorToken{};
+static void ScheduleAnchor() {
+    if (t_anchorPending || !TitleBarMoveOn()) return;
+    t_anchorPending = true;
+    t_anchorToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        muxm::CompositionTarget::Rendering(t_anchorToken);
+        t_anchorPending = false;
+        try {
+            HookCommandBarPopovers(true);
+        } catch (...) {
+        }
+    });
+}
+
+static void ScheduleTitleBar();
 void Ui_ElementAdded(const std::wstring& name) {
     if (name == L"NavigationBarContent" || name == L"AssistantBarHost" || name == L"BackButton" ||
         name == L"CommandBarContainerRoot" || name == L"VariantHost") {
@@ -4589,7 +4766,11 @@ void Ui_ElementAdded(const std::wstring& name) {
         ScheduleArcAdopt();
     }
     if (name == L"ActionsRow") ScheduleHoverCards();
-    if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton") ScheduleToolbarLook();
+    if (name == L"PopoverLayoutRoot" || name == L"CommandBarContainerRoot") ScheduleAnchor();
+    if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton" ||
+        name == L"VariantHost")
+        ScheduleToolbarLook();
+    if (name == L"NavigationBarHost" || name == L"VariantHost" || name == L"ContentGroup") ScheduleTitleBar();
 }
 
 static void UpdateArcBar() {
@@ -5548,6 +5729,466 @@ static void UpdateNewTabMode() {
     if (t_newTabMode && !t_clearToken && !FocusedQueryBox()) t_newTabMode = false;
 }
 
+// ---------------------------------------------------------------- Toolbar in the title bar
+// Dia builds a toolbar into every tab's pane, inside the pane's rounded border, so it scales and shows the
+// pane's outline when a side panel opens. Here the shown tab's whole toolbar (NavigationBarHost, the real
+// element, so everything in it keeps working) moves into a row of its own at the top of the window grid,
+// above the page and side panels; the pane's toolbar row is closed up, so the page card starts below it.
+// Switching tabs moves the new tab's toolbar up and gives the old one back. In split view the selected
+// pane's toolbar is the one up there and the other panes' toolbars are hidden. The hidden toolbar
+// leaves Dia's layout as it is.
+
+// A pane's toolbar hidden in split view (the selected pane's is up in the title bar).
+struct HiddenToolbar {
+    winrt::weak_ref<mux::FrameworkElement> bar;
+    winrt::weak_ref<muxc::Grid> chrome;  // its NavigationChromeHost
+    wf::IInspectable visibility{nullptr};  // the bar's own Visibility value, as Dia had it (unset: null)
+    muxc::RowDefinition row{nullptr};      // held strongly, as TitleBarState::row
+    double rowMax = 0;
+};
+// Split view: a pane's close (X) is hidden (tabs close from the sidebar; floated over the page it covered
+// the site). Dia's own visibility (a binding, a value, or none) goes back when split view ends.
+struct PaneClose {
+    winrt::weak_ref<mux::FrameworkElement> button;
+    wf::IInspectable local{nullptr};
+    mux::Data::BindingBase binding{nullptr};
+};
+
+struct TitleBarState {
+    winrt::weak_ref<muxc::Grid> main;       // the window grid holding ContentGroup
+    muxc::Grid host{nullptr};               // our row
+    winrt::weak_ref<mux::FrameworkElement> bar;   // the toolbar we moved
+    winrt::weak_ref<muxc::Grid> from;       // its pane's NavigationChromeHost
+    uint32_t index = 0;
+    double rowMax = 0;                      // that pane's toolbar row's MaxHeight, as Dia had it (its Height
+    // is held by Dia, so the row is capped at 0 instead). Held strongly: a weak reference to a
+    // RowDefinition doesn't resolve, which left the row at 0 (no toolbar) after the tweak went off.
+    muxc::RowDefinition row{nullptr};
+    std::vector<HiddenToolbar> others;      // split view: the other panes' toolbars
+    // Split view: Dia drops the window grid below its 44-pixel caption row (the window buttons' row), so
+    // our row sat under it: two rows. It's lifted back to the top, as with one page. Dia's own Row and
+    // RowSpan (a binding, a value, or none) are kept to put back if the tweak goes off mid-split.
+    bool lifted = false, liftHeld = false;
+    wf::IInspectable rowLocal{nullptr}, spanLocal{nullptr};
+    mux::Data::BindingBase rowBinding{nullptr}, spanBinding{nullptr};
+    std::vector<PaneClose> closes;          // split view: each pane's close (X), hidden
+};
+static thread_local std::vector<TitleBarState> t_titleBars;
+
+static void HideOther(TitleBarState& st, const mux::FrameworkElement& bar, const muxc::Grid& chrome) {
+    for (auto& h : st.others)
+        if (h.bar.get() == bar) {
+            if (bar.Visibility() != mux::Visibility::Collapsed) bar.Visibility(mux::Visibility::Collapsed);
+            return;
+        }
+    HiddenToolbar h;
+    h.bar = winrt::make_weak(bar);
+    h.chrome = winrt::make_weak(chrome);
+    auto local = bar.ReadLocalValue(mux::UIElement::VisibilityProperty());
+    if (local != mux::DependencyProperty::UnsetValue()) h.visibility = local;
+    if (chrome.RowDefinitions().Size()) {
+        h.row = chrome.RowDefinitions().GetAt(0);
+        h.rowMax = h.row.MaxHeight();
+        h.row.MaxHeight(0);
+    }
+    bar.Visibility(mux::Visibility::Collapsed);
+    st.others.push_back(std::move(h));
+}
+
+static void UncapOthers(TitleBarState& st) {
+    for (auto& h : st.others) {
+        if (auto bar = h.bar.get()) {
+            if (h.visibility) bar.SetValue(mux::UIElement::VisibilityProperty(), h.visibility);
+            else bar.ClearValue(mux::UIElement::VisibilityProperty());
+        }
+        if (h.row) h.row.MaxHeight(h.rowMax);
+    }
+    if (!st.others.empty()) Log("title bar: split view over, pane toolbars back");
+    st.others.clear();
+}
+
+static void ReturnTitleBar(TitleBarState& st) {
+    auto bar = st.bar.get();
+    auto from = st.from.get();
+    if (bar) {
+        if (auto cur = muxm::VisualTreeHelper::GetParent(bar).try_as<muxc::Panel>()) {
+            uint32_t i;
+            if (cur.Children().IndexOf(bar, i)) cur.Children().RemoveAt(i);
+        }
+        if (from) from.Children().InsertAt((std::min)(st.index, from.Children().Size()), bar);
+    }
+    if (st.row) st.row.MaxHeight(st.rowMax);
+    st.row = nullptr;
+    st.bar = nullptr;
+    st.from = nullptr;
+}
+
+static void SaveDiaValue(const mux::FrameworkElement& el, const mux::DependencyProperty& dp, wf::IInspectable& local,
+                         mux::Data::BindingBase& binding) {
+    local = nullptr, binding = nullptr;
+    if (auto be = el.GetBindingExpression(dp)) {
+        binding = be.ParentBinding();
+        return;
+    }
+    auto v = el.ReadLocalValue(dp);
+    if (v && v != mux::DependencyProperty::UnsetValue()) local = v;
+}
+
+static void RestoreDiaValue(const mux::FrameworkElement& el, const mux::DependencyProperty& dp, const wf::IInspectable& local,
+                            const mux::Data::BindingBase& binding) {
+    if (binding) el.SetBinding(dp, binding);
+    else if (local) el.SetValue(dp, local);
+    else el.ClearValue(dp);
+}
+
+// Split view: the window grid back up into the caption row (Row 0, spanning both rows, as Dia has it with
+// one page), so the toolbar shares the row with the window buttons.
+static void LiftWindowGrid(TitleBarState& st, const muxc::Grid& main) {
+    auto outer = muxm::VisualTreeHelper::GetParent(main).try_as<muxc::Grid>();
+    if (!outer) return;
+    auto rows = outer.RowDefinitions();
+    if (!st.lifted) {
+        if (muxc::Grid::GetRow(main) != 1 || rows.Size() != 2 || rows.GetAt(0).Height().GridUnitType != mux::GridUnitType::Pixel)
+            return;
+        SaveDiaValue(main, muxc::Grid::RowProperty(), st.rowLocal, st.rowBinding);
+        SaveDiaValue(main, muxc::Grid::RowSpanProperty(), st.spanLocal, st.spanBinding);
+        st.lifted = true;
+        st.liftHeld = false;
+        Log("title bar: split view, window grid lifted into the %.0f px caption row (Dia's row %s)",
+            rows.GetAt(0).Height().Value, st.rowBinding ? "bound" : st.rowLocal ? "set" : "unset");
+    }
+    if (muxc::Grid::GetRow(main) != 0) muxc::Grid::SetRow(main, 0);
+    if (muxc::Grid::GetRowSpan(main) != 2) muxc::Grid::SetRowSpan(main, 2);
+    if (muxc::Grid::GetRow(main) != 0 && !st.liftHeld) {
+        st.liftHeld = true;
+        Log("title bar: Dia holds the window grid's row (a visual state?); it stays below the caption row");
+    }
+}
+
+// restore: put Dia's values back (the tweak went off mid-split). Otherwise split view just ended, and Dia
+// sets the one-page layout itself (Row 0 over both rows, which is also what we set).
+static void DropLift(TitleBarState& st, bool restore) {
+    if (!st.lifted) return;
+    if (auto main = st.main.get()) {
+        // A binding of Dia's goes back either way (our value replaced it, and only it can move the grid
+        // again next time); a plain value only when undoing, since Dia sets its own as split view ends.
+        if (restore) {
+            RestoreDiaValue(main, muxc::Grid::RowProperty(), st.rowLocal, st.rowBinding);
+            RestoreDiaValue(main, muxc::Grid::RowSpanProperty(), st.spanLocal, st.spanBinding);
+        } else {
+            if (st.rowBinding) main.SetBinding(muxc::Grid::RowProperty(), st.rowBinding);
+            if (st.spanBinding) main.SetBinding(muxc::Grid::RowSpanProperty(), st.spanBinding);
+        }
+    }
+    st.lifted = false;
+    st.rowLocal = st.spanLocal = nullptr;
+    st.rowBinding = st.spanBinding = nullptr;
+    if (st.host) st.host.Padding({0, 0, 0, 0});
+    Log("title bar: window grid lift %s", restore ? "undone" : "over (split view ended)");
+}
+
+// Dia keeps the window grid a few pixels below the window's top (the page card's margin; Edge-to-edge
+// takes it away), and our row with it: the toolbar sat 4 px lower than the window buttons, with that much
+// more above the page than Dia's own layout has. The row is pulled up level with the buttons, and the page
+// follows (the row is Auto). Measured, not fixed: none with Edge-to-edge, or split view's lifted grid.
+static void AlignTitleBarTop(TitleBarState& st, const muxc::Grid& main) {
+    if (!st.host) return;
+    double lift = 0;
+    try {
+        for (auto h : FindNodes(L"MinimizeButton")) {
+            auto btn = Obj<mux::FrameworkElement>(h);
+            if (!btn || btn.XamlRoot() != main.XamlRoot() || btn.ActualHeight() < 1) continue;
+            double buttonsTop = btn.TransformToVisual(nullptr).TransformPoint({0, 0}).Y;
+            double gridTop = main.TransformToVisual(nullptr).TransformPoint({0, 0}).Y;  // our margin doesn't move it
+            lift = (std::max)(0.0, std::round(gridTop - buttonsTop));
+            break;
+        }
+    } catch (...) {
+        return;
+    }
+    if (std::abs(st.host.Margin().Top + lift) > 0.5) st.host.Margin({0, -lift, 0, 0});
+}
+
+// Lifted, the toolbar runs under the caption row's right end (Dia's chat button there in split view, and
+// the window buttons): our row leaves room for whatever of it is showing.
+static void ReserveCaptionRoom(TitleBarState& st, const muxc::Grid& main) {
+    if (!st.host || !st.lifted) return;
+    double left = 1e9;
+    for (auto h : FindNodes(L"MinimizeButton")) {
+        auto btn = Obj<mux::FrameworkElement>(h);
+        if (!btn || btn.XamlRoot() != main.XamlRoot()) continue;
+        auto buttons = muxm::VisualTreeHelper::GetParent(btn);
+        auto caption = buttons ? muxm::VisualTreeHelper::GetParent(buttons).try_as<muxc::Grid>() : nullptr;
+        if (!caption) continue;
+        for (auto child : caption.Children()) {
+            auto fe = child.try_as<mux::FrameworkElement>();
+            if (!fe || muxc::Grid::GetColumn(fe) < 1 || fe.Visibility() != mux::Visibility::Visible || !fe.IsHitTestVisible() ||
+                fe.ActualWidth() < 1)
+                continue;
+            left = (std::min)(left, (double)fe.TransformToVisual(nullptr).TransformPoint({0, 0}).X);
+        }
+    }
+    double pad = 0;
+    if (left < 1e9) {
+        double right = st.host.TransformToVisual(nullptr).TransformPoint({0, 0}).X + st.host.ActualWidth();
+        double own = 0;  // room Dia's toolbar already leaves (its margin, with one page)
+        if (auto bar = st.bar.get())
+            if (auto content = FindByName(bar, L"NavigationBarContent")) own = content.Margin().Right;
+        pad = (std::max)(0.0, std::round(right - left - own));
+    }
+    if (std::abs(st.host.Padding().Right - pad) > 0.5) st.host.Padding({0, 0, pad, 0});
+}
+
+static void ReturnPaneCloses(TitleBarState& st) {
+    if (st.closes.empty()) return;
+    for (auto& c : st.closes)
+        if (auto btn = c.button.get()) RestoreDiaValue(btn, mux::UIElement::VisibilityProperty(), c.local, c.binding);
+    st.closes.clear();
+    Log("title bar: pane close buttons back");
+}
+
+// panes: each split pane on screen with its toolbar (wherever that is now). Dia may show the button again
+// (a new tab in a pane brings its own toolbar): it's hidden again on the next pass.
+static void HidePaneCloses(TitleBarState& st, const std::vector<std::pair<mux::FrameworkElement, mux::FrameworkElement>>& panes) {
+    std::vector<mux::FrameworkElement> now;
+    for (auto& [pane, bar] : panes) {
+        auto btn = bar ? FindByName(bar, L"CloseButton") : nullptr;
+        if (!btn) continue;
+        now.push_back(btn);
+        auto it = std::find_if(st.closes.begin(), st.closes.end(), [&](PaneClose& c) { return c.button.get() == btn; });
+        if (it == st.closes.end()) {
+            PaneClose c;
+            c.button = winrt::make_weak(btn);
+            SaveDiaValue(btn, mux::UIElement::VisibilityProperty(), c.local, c.binding);
+            st.closes.push_back(std::move(c));
+            Log("title bar: pane close hidden (%zu)", st.closes.size());
+        }
+        if (btn.Visibility() != mux::Visibility::Collapsed) btn.Visibility(mux::Visibility::Collapsed);
+    }
+    // A pane that left (closed, or its tab replaced): its old button gets Dia's visibility back.
+    for (auto it = st.closes.begin(); it != st.closes.end();) {
+        auto btn = it->button.get();
+        if (btn && std::find(now.begin(), now.end(), btn) != now.end()) {
+            ++it;
+            continue;
+        }
+        if (btn) RestoreDiaValue(btn, mux::UIElement::VisibilityProperty(), it->local, it->binding);
+        it = st.closes.erase(it);
+    }
+}
+
+static void RemoveTitleBar(TitleBarState& st) {
+    ReturnPaneCloses(st);
+    DropLift(st, true);
+    UncapOthers(st);
+    ReturnTitleBar(st);
+    if (auto main = st.main.get(); main && st.host) {
+        uint32_t i;
+        if (main.Children().IndexOf(st.host, i)) main.Children().RemoveAt(i);
+    }
+    st.host = nullptr;
+}
+
+static void UpdateTitleBar() {
+    bool on = TitleBarMoveOn();
+    if (!on) {
+        for (auto& st : t_titleBars) RemoveTitleBar(st);
+        t_titleBars.clear();
+        return;
+    }
+    t_titleBars.erase(std::remove_if(t_titleBars.begin(), t_titleBars.end(),
+                                     [](TitleBarState& st) {
+                                         if (st.main.get()) return false;
+                                         return true;
+                                     }),
+                      t_titleBars.end());
+    for (auto h : FindNodes(L"ContentGroup")) {
+        auto group = Obj<mux::FrameworkElement>(h);
+        auto main = group ? muxm::VisualTreeHelper::GetParent(group).try_as<muxc::Grid>() : nullptr;
+        if (!main || !main.XamlRoot()) continue;
+        // ContentGroup sits in row 1 under an Auto row 0 (Dia's empty tab-strip inset): our row goes there.
+        auto rows = main.RowDefinitions();
+        if (rows.Size() < 2 || rows.GetAt(0).Height().GridUnitType != mux::GridUnitType::Auto ||
+            muxc::Grid::GetRow(group) != 1)
+            continue;
+        auto it = std::find_if(t_titleBars.begin(), t_titleBars.end(), [&](TitleBarState& st) { return st.main.get() == main; });
+        if (it == t_titleBars.end()) {
+            TitleBarState st;
+            st.main = winrt::make_weak(main);
+            t_titleBars.push_back(st);
+            it = std::prev(t_titleBars.end());
+            Log("title bar: on");
+        }
+        auto& st = *it;
+        if (!st.host) {
+            st.host = muxc::Grid();
+            st.host.Name(L"diatweaksTitleBar");
+            st.host.VerticalAlignment(mux::VerticalAlignment::Top);
+            muxc::Grid::SetRow(st.host, 0);
+            muxc::Grid::SetColumnSpan(st.host, (std::max)(1, (int)main.ColumnDefinitions().Size()));
+            main.Children().Append(st.host);
+        }
+        // Every pane on screen with a toolbar: one normally, one per pane in split view. A pane counts by
+        // the pane itself being shown (its toolbar may be the one up here, or hidden by us in split view).
+        auto paneOf = [](const mux::FrameworkElement& chrome) {
+            return muxm::VisualTreeHelper::GetParent(chrome).try_as<mux::FrameworkElement>();
+        };
+        std::vector<mux::FrameworkElement> bars;  // toolbars still in their panes
+        for (auto bh : FindNodes(L"NavigationBarHost")) {
+            auto b = Obj<mux::FrameworkElement>(bh);
+            if (!b || b.XamlRoot() != main.XamlRoot()) continue;
+            auto parent = muxm::VisualTreeHelper::GetParent(b).try_as<mux::FrameworkElement>();
+            if (!parent || parent.Name() != L"NavigationChromeHost") continue;
+            auto pane = paneOf(parent);
+            if (pane && ShownOnScreen(pane)) bars.push_back(b);
+        }
+        auto ours = st.bar.get();
+        mux::FrameworkElement oursPane{nullptr};
+        if (auto from = st.from.get(); from && ours) oursPane = paneOf(from);
+        bool oursShown = oursPane && ShownOnScreen(oursPane);
+        size_t shown = bars.size() + (oursShown ? 1 : 0);
+        if (shown == 0) {  // its tab has left the screen (closed, or a page without a toolbar)
+            ReturnPaneCloses(st);
+            DropLift(st, false);
+            UncapOthers(st);
+            if (ours) ReturnTitleBar(st);
+            continue;
+        }
+        // Which pane's toolbar belongs up here: the only one, or in split view the selected pane, the one
+        // holding keyboard focus (clicking a pane focuses its page). Focus elsewhere (the sidebar, the
+        // address box): keep the one we have.
+        mux::FrameworkElement active{nullptr};
+        if (shown == 1) active = oursShown ? ours : bars[0];
+        else {
+            std::vector<mux::DependencyObject> focus;
+            try {
+                for (auto f = mux::Input::FocusManager::GetFocusedElement(main.XamlRoot()).try_as<mux::DependencyObject>(); f;
+                     f = muxm::VisualTreeHelper::GetParent(f))
+                    focus.push_back(f);
+            } catch (...) {
+            }
+            auto focused = [&](const mux::FrameworkElement& pane) {
+                return pane && std::find(focus.begin(), focus.end(), pane) != focus.end();
+            };
+            for (auto& b : bars)
+                if (focused(paneOf(muxm::VisualTreeHelper::GetParent(b).as<mux::FrameworkElement>()))) active = b;
+            if (!active) active = oursShown ? ours : bars[0];
+        }
+        if (active != ours) {
+            // Another pane's toolbar comes up: give back the one we have (and every hidden one, so the row
+            // we're about to close up still has Dia's own height limit to save).
+            UncapOthers(st);
+            auto from = muxm::VisualTreeHelper::GetParent(active).as<muxc::Grid>();
+            uint32_t idx;
+            if (!from.Children().IndexOf(active, idx)) continue;
+            ReturnTitleBar(st);
+            from.Children().RemoveAt(idx);
+            st.bar = winrt::make_weak(active);
+            st.from = winrt::make_weak(from);
+            st.index = idx;
+            if (from.RowDefinitions().Size()) {
+                auto row = from.RowDefinitions().GetAt(0);
+                st.rowMax = row.MaxHeight();
+                st.row = row;
+                row.MaxHeight(0);
+                Log("title bar: moved; pane row capped (max %.0f -> %.0f)", st.rowMax, row.MaxHeight());
+            }
+            st.host.Children().Append(active);
+        }
+        // Split view: the other panes' toolbars are hidden and their rows closed up; the one up here serves
+        // the selected pane. Back as they were once split view ends.
+        if (shown > 1) {
+            std::vector<std::pair<mux::FrameworkElement, mux::FrameworkElement>> panes;  // pane, its toolbar
+            if (auto from = st.from.get(); from && st.bar.get())
+                if (auto pane = paneOf(from)) panes.push_back({pane, st.bar.get()});
+            for (auto bh : FindNodes(L"NavigationBarHost")) {
+                auto b = Obj<mux::FrameworkElement>(bh);
+                if (!b || b == active || b.XamlRoot() != main.XamlRoot()) continue;
+                auto chrome = muxm::VisualTreeHelper::GetParent(b).try_as<muxc::Grid>();
+                if (!chrome || chrome.Name() != L"NavigationChromeHost") continue;
+                if (auto pane = paneOf(chrome); pane && ShownOnScreen(pane)) {
+                    HideOther(st, b, chrome);
+                    panes.push_back({pane, b});
+                }
+            }
+            LiftWindowGrid(st, main);
+            ReserveCaptionRoom(st, main);
+            HidePaneCloses(st, panes);
+        } else {
+            ReturnPaneCloses(st);
+            DropLift(st, false);
+            UncapOthers(st);
+        }
+        AlignTitleBarTop(st, main);
+    }
+}
+
+// The toolbar's controls, as spans across it (DIPs): anything that is a control takes the press itself.
+static void ToolbarControlSpans(const mux::DependencyObject& d, std::vector<std::pair<double, double>>& out, int depth) {
+    int n = muxm::VisualTreeHelper::GetChildrenCount(d);
+    for (int i = 0; i < n; i++) {
+        auto fe = muxm::VisualTreeHelper::GetChild(d, i).try_as<mux::FrameworkElement>();
+        if (!fe || fe.Visibility() != mux::Visibility::Visible || !fe.IsHitTestVisible() || fe.ActualWidth() < 1 ||
+            fe.Opacity() < 0.01)
+            continue;
+        if (fe.try_as<muxc::Control>()) {
+            double x = fe.TransformToVisual(nullptr).TransformPoint({0, 0}).X;
+            out.push_back({x, x + fe.ActualWidth()});
+        } else if (depth < 40) {
+            ToolbarControlSpans(fe, out, depth + 1);
+        }
+    }
+}
+
+// Split view, toolbar lifted into the caption row: Dia's drag strip there covers the whole row (it knows of
+// no toolbar in it), which would take every press on the toolbar. The strip is cut to the sidebar part
+// (leftPx, client pixels), and the toolbar's empty stretches between its controls drag instead (out).
+static bool TitleBarLiftedDrags(const mux::XamlRoot& root, int& leftPx, std::vector<std::pair<int, int>>& out) {
+    for (auto& st : t_titleBars) {
+        if (!st.lifted || !st.host || st.host.XamlRoot() != root) continue;
+        try {
+            double scale = root.RasterizationScale();
+            leftPx = (int)std::floor(st.host.TransformToVisual(nullptr).TransformPoint({0, 0}).X * scale);
+            auto bar = st.bar.get();
+            auto content = bar ? FindByName(bar, L"NavigationBarContent") : nullptr;
+            if (!content || content.ActualWidth() < 1) return true;
+            double c0 = content.TransformToVisual(nullptr).TransformPoint({0, 0}).X, c1 = c0 + content.ActualWidth();
+            std::vector<std::pair<double, double>> solid;
+            ToolbarControlSpans(content, solid, 0);
+            std::sort(solid.begin(), solid.end());
+            double at = c0;
+            auto gap = [&](double a, double b) {
+                int l = (int)std::ceil(a * scale), r = (int)std::floor(b * scale);
+                if (r - l > 2) out.push_back({l, r});
+            };
+            for (auto [a, b] : solid) {
+                if (a > at) gap(at, a);
+                at = (std::max)(at, b);
+            }
+            if (c1 > at) gap(at, c1);
+        } catch (...) {
+        }
+        return true;
+    }
+    return false;
+}
+
+static thread_local bool t_titlePending = false;
+static thread_local winrt::event_token t_titleToken{};
+// A tab's view (with its own toolbar) just came in: move its toolbar up before the frame is drawn.
+static void ScheduleTitleBar() {
+    if (t_titlePending || !TitleBarMoveOn()) return;
+    t_titlePending = true;
+    t_titleToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        muxm::CompositionTarget::Rendering(t_titleToken);
+        t_titlePending = false;
+        try {
+            UpdateTitleBar();
+        } catch (...) {
+        }
+    });
+}
+
 // ---------------------------------------------------------------- window buttons (minimize/maximize/close)
 // Hidden window buttons must also stop being buttons: Dia registers their areas with Windows
 // (InputNonClientPointerSource), so a click on the empty spot would still minimize or close Dia. While
@@ -5773,6 +6414,26 @@ static void GlueCaptionButtons(const mux::FrameworkElement& grid, double height)
         if (!std::isnan(bg.Height())) bg.Height(std::numeric_limits<double>::quiet_NaN());
         if (bg.HorizontalAlignment() != mux::HorizontalAlignment::Stretch) bg.HorizontalAlignment(mux::HorizontalAlignment::Stretch);
         if (bg.VerticalAlignment() != mux::VerticalAlignment::Stretch) bg.VerticalAlignment(mux::VerticalAlignment::Stretch);
+        // Toolbar in the title bar: Dia's template sets the glyph 4 px down for its inset, so with the
+        // toolbar lifted level with the buttons it sat 2 px low. Shifted (a render offset, so layout doesn't
+        // change) to the background's middle; back to Dia's spot when the toolbar isn't up there.
+        auto cp = FindVisual(child, [](const mux::DependencyObject& d) {
+            auto fe = d.try_as<mux::FrameworkElement>();
+            return fe && fe.Name() == L"ContentPresenter";
+        }).try_as<mux::FrameworkElement>();
+        if (!cp) continue;
+        float dy = 0;
+        if (TitleBarMoveOn() && bg.ActualHeight() >= 1 && cp.ActualHeight() >= 1) {
+            try {
+                // Layout offsets in their shared parent (no transforms in them), so our own shift isn't measured.
+                double bgMid = bg.ActualOffset().y + bg.ActualHeight() / 2;
+                double cpMid = cp.ActualOffset().y + cp.ActualHeight() / 2;
+                dy = (float)std::round(bgMid - cpMid);
+            } catch (...) {
+            }
+        }
+        auto t = cp.Translation();
+        if (std::abs(t.y - dy) > 0.1f) cp.Translation({t.x, dy, t.z});
     }
 }
 
@@ -6018,8 +6679,43 @@ struct SinkState {
     HRGN dia = nullptr;     // Dia's shape (owned copy), or null if it had none
     bool diaHadRegion = false;
     HRGN mine = nullptr;    // the shape we last applied (owned copy, for comparing)
+    std::vector<std::pair<int, int>> drags;  // our added drag spans (client pixels of the top window)
+    bool hooked = false;
+    DWORD lastDown = 0;
+    POINT lastAt{};
 };
 static thread_local std::map<HWND, SinkState> t_sinks;  // keyed by top-level window
+
+// Dia's sink starts a drag only on the spots it knows. A press on one of ours is made a title-bar press of
+// the window (a drag, or with a quick second press, maximize or restore).
+static LRESULT CALLBACK SinkProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR ref) {
+    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK) {
+        HWND top = (HWND)ref;
+        auto it = t_sinks.find(top);
+        if (it != t_sinks.end() && !it->second.drags.empty()) {
+            POINT p{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)};
+            ClientToScreen(h, &p);
+            POINT c = p;
+            ScreenToClient(top, &c);
+            for (auto [l, r] : it->second.drags)
+                if (c.x >= l && c.x < r) {
+                    auto& st = it->second;
+                    DWORD now = GetTickCount();
+                    bool dbl = msg == WM_LBUTTONDBLCLK ||
+                               (now - st.lastDown <= GetDoubleClickTime() && std::abs(p.x - st.lastAt.x) <= GetSystemMetrics(SM_CXDOUBLECLK) &&
+                                std::abs(p.y - st.lastAt.y) <= GetSystemMetrics(SM_CYDOUBLECLK));
+                    st.lastDown = dbl ? 0 : now;
+                    st.lastAt = p;
+                    ReleaseCapture();
+                    if (dbl) SendMessageW(top, WM_SYSCOMMAND, IsZoomed(top) ? SC_RESTORE : SC_MAXIMIZE, 0);
+                    else SendMessageW(top, WM_NCLBUTTONDOWN, HTCAPTION, MAKELPARAM(p.x, p.y));
+                    return 0;
+                }
+        }
+    }
+    if (msg == WM_NCDESTROY) RemoveWindowSubclass(h, SinkProc, 1);
+    return DefSubclassProc(h, msg, wp, lp);
+}
 
 static HWND FindSink(HWND top) {
     struct Ctx { HWND found = nullptr; } ctx;
@@ -6048,12 +6744,19 @@ static void RestoreSink(SinkState& st) {
     if (st.mine) DeleteObject(st.mine), st.mine = nullptr;
 }
 
-// pageLeftPx: where the page starts, in the top-level window's client pixels.
-static void TrimSink(HWND top, bool trim, int pageLeftPx) {
+// pageLeftPx: where the page starts, in the top-level window's client pixels. trim: keep only the sidebar
+// part (the toolbar is hidden). drags: more spans (left, right in client pixels, the strip's full height)
+// that drag the window, the empty ends of the address bar around its three parts.
+// keepDrags: the drag spans are over a toolbar that is showing (split view's lifted one), not a hidden one.
+static void TrimSink(HWND top, bool trim, int pageLeftPx, const std::vector<std::pair<int, int>>& drags = {},
+                     bool keepDrags = false) {
     auto& st = t_sinks[top];
     if (!st.sink || !IsWindow(st.sink)) st = SinkState{}, st.sink = FindSink(top);
     if (!st.sink) return;
-    if (!trim) {
+    st.drags = drags;
+    if (!st.hooked && !drags.empty() && GetWindowThreadProcessId(st.sink, nullptr) == GetCurrentThreadId())
+        st.hooked = SetWindowSubclass(st.sink, SinkProc, 1, (DWORD_PTR)top);
+    if (!trim && drags.empty()) {
         if (st.mine) RestoreSink(st);
         return;
     }
@@ -6064,18 +6767,34 @@ static void TrimSink(HWND top, bool trim, int pageLeftPx) {
         if (st.dia) DeleteObject(st.dia);
         st.dia = has ? CopyRgn(cur) : nullptr;
         st.diaHadRegion = has;
-        RECT wr;
-        GetWindowRect(st.sink, &wr);
-        POINT origin{0, 0};
-        ClientToScreen(top, &origin);
-        int keepW = pageLeftPx - (wr.left - origin.x);  // sidebar part, in the sink's own coordinates
-        HRGN want = CreateRectRgn(0, 0, (std::max)(0, keepW), wr.bottom - wr.top);
-        if (has) CombineRgn(want, want, cur, RGN_AND);
-        if (st.mine) DeleteObject(st.mine);
-        st.mine = CopyRgn(want);
-        SetWindowRgn(st.sink, want, TRUE);  // the system now owns `want`
+        if (st.mine) DeleteObject(st.mine), st.mine = nullptr;
     }
     DeleteObject(cur);
+    if (!st.diaHadRegion && !trim) return;  // all of it drags already
+    RECT wr;
+    GetWindowRect(st.sink, &wr);
+    POINT origin{0, 0};
+    ClientToScreen(top, &origin);
+    int ox = wr.left - origin.x, h = wr.bottom - wr.top;
+    HRGN want = st.diaHadRegion ? CopyRgn(st.dia) : CreateRectRgn(0, 0, wr.right - wr.left, h);
+    if (trim) {
+        HRGN keep = CreateRectRgn(0, 0, (std::max)(0, pageLeftPx - ox), h);  // sidebar part, in the sink's own coordinates
+        CombineRgn(want, want, keep, RGN_AND);
+        DeleteObject(keep);
+    }
+    for (auto [l, r] : drags) {
+        if (trim && !keepDrags && l >= pageLeftPx) continue;
+        HRGN add = CreateRectRgn(l - ox, 0, r - ox, h);
+        CombineRgn(want, want, add, RGN_OR);
+        DeleteObject(add);
+    }
+    if (st.mine && EqualRgn(want, st.mine)) {
+        DeleteObject(want);
+        return;
+    }
+    if (st.mine) DeleteObject(st.mine);
+    st.mine = CopyRgn(want);
+    SetWindowRgn(st.sink, want, TRUE);  // the system now owns `want`
 }
 
 // The top-level Dia window showing this XAML root: one of this thread's WinUI windows with a caption
@@ -6197,7 +6916,13 @@ static void UpdateCaptionTrim() {
             TrimCaption(c);
         } else
             UntrimCaption(c);
-        if (top) TrimSink(top, hiddenBar, c.pageLeft);
+        // Toolbar in the title bar, split view: the toolbar is lifted into the caption row, where Dia's drag
+        // strip would take every press on it; the strip keeps the sidebar part and the toolbar's empty
+        // stretches drag instead (TitleBarLiftedDrags).
+        std::vector<std::pair<int, int>> drags;
+        int liftLeft = 0;
+        bool lifted = !hiddenBar && TitleBarLiftedDrags(root, liftLeft, drags);
+        if (top) TrimSink(top, hiddenBar || lifted, lifted ? liftLeft : c.pageLeft, drags, lifted);
         if (!hiddenBar) UpdateArcWinCaption(c, root);
     }
 }
@@ -6295,6 +7020,36 @@ void Ui_WatchProperty(InstanceHandle h, const std::wstring& prop) {
     }
 }
 
+// Toolbar in the title bar: Dia's drag button over the address box is gone up there and the address text
+// only displays (tweaks.conf), so a click on the field opens Dia's address box, as Ctrl+L does. Clicks on
+// the field's own buttons (site menu, ...) stay theirs.
+static thread_local std::set<InstanceHandle> t_addressClickHooked;
+
+static void HookAddressClicks() {
+    if (!TitleBarMoveOn()) return;
+    for (auto h : FindNodes(L"AssistantBar")) {
+        auto bar = Obj<mux::UIElement>(h);
+        if (!bar || !t_addressClickHooked.insert(h).second) continue;
+        bar.AddHandler(mux::UIElement::TappedEvent(),
+                       winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const&,
+                                                                            mux::Input::TappedRoutedEventArgs const& e) {
+                           try {
+                               if (!TitleBarMoveOn()) return;
+                               for (auto d = e.OriginalSource().try_as<mux::DependencyObject>(); d;
+                                    d = muxm::VisualTreeHelper::GetParent(d)) {
+                                   if (d.try_as<muxc::Primitives::ButtonBase>()) return;
+                                   if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"AssistantBar") break;
+                               }
+                               // Ctrl+L is sent as keys: with Shift or Alt held Dia would get another shortcut.
+                               if ((GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU)) & 0x8000) return;
+                               OpenCommandBar();
+                           } catch (...) {
+                           }
+                       })),
+                       true);
+    }
+}
+
 // ---------------------------------------------------------------- tick
 
 bool Ui_Tick() {
@@ -6317,6 +7072,10 @@ bool Ui_Tick() {
         StyleStartPages();
         stage = "hiddenToolbar";
         UpdateHiddenToolbar();
+        stage = "titleBar";
+        UpdateTitleBar();
+        HookAddressClicks();
+        if (TitleBarMoveOn()) HookCommandBarPopovers(false);  // the address box, centered under its field
         stage = "commandBar";
         if (Engine_TweakOn(L"floatingNewTab")) InstallArcKeys();
         if ((Engine_TweakOn(L"floatingNewTab") || ArcWindowsOn()) && !ArcSidebarOn())

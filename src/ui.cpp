@@ -34,6 +34,9 @@
 #include <winrt/Microsoft.UI.Xaml.Automation.Provider.h>
 #include <winrt/Microsoft.UI.Xaml.Data.h>
 #include <winrt/Microsoft.UI.Xaml.Media.h>
+#include <winrt/Microsoft.UI.Xaml.Media.Animation.h>
+#include <winrt/Windows.System.h>
+#include <winrt/Microsoft.UI.Dispatching.h>
 #include <winrt/Microsoft.UI.Xaml.Shapes.h>
 #include <winrt/Microsoft.UI.Xaml.Documents.h>
 
@@ -44,6 +47,10 @@
 #include <set>
 #include <sstream>
 #include <thread>
+
+#include <mmdeviceapi.h>
+#include <audiopolicy.h>
+#include <audioclient.h>
 
 #include "engine.h"
 
@@ -280,6 +287,32 @@ static void RunProbe() {
         if (nm == L"REGIONS") {
             extern void ProbeRegions(std::ostringstream & o);
             ProbeRegions(o);
+            continue;
+        }
+        if (nm == L"TIDYPOST" || nm == L"TIDYSTATE") {  // posts the prompt to the parked chat / reports it
+            extern std::string Tidy_DebugSend(bool post);
+            o << Tidy_DebugSend(nm == L"TIDYPOST") << "\n";
+            continue;
+        }
+        if (nm == L"FLYOUTS") {  // elements with a right-click menu, and what's in them
+            extern std::string Tidy_DebugFlyouts();
+            o << Tidy_DebugFlyouts();
+            continue;
+        }
+        if (nm == L"TIDYRUN") {  // the broom's click, as is (for testing)
+            extern void Tidy_DebugRun();
+            Tidy_DebugRun();
+            o << "tidy started (see tap.log)\n";
+            continue;
+        }
+        if (nm == L"TIDYOPEN" || nm == L"TIDYCLOSE") {  // the parked chat panel, opened or closed (for testing)
+            extern std::string Tidy_Debug(bool open);
+            o << Tidy_Debug(nm == L"TIDYOPEN") << "\n";
+            continue;
+        }
+        if (nm == L"CHATBUTTON") {  // presses Dia's Chat button (opens or closes its chat panel), even when hidden
+            extern bool Tidy_PressChatButton();
+            o << "chat button: " << (Tidy_PressChatButton() ? "pressed" : "not found") << "\n";
             continue;
         }
         if (nm == L"FOCUS") {  // which element has keyboard focus, and its ancestors
@@ -572,7 +605,7 @@ static void ApplyPreset(const std::wstring& preset) {
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
-                                               L"peek"};
+                                               L"peek",           L"tidyTabs"};
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
         if (t.key != L"preset" && t.key != L"checkForUpdates" && t.key != L"normalLaunch" && !t.noSwitch)  // settings, not patches
@@ -1936,6 +1969,1368 @@ static void UpdateProfileEmoji() {
             t_emoji.push_back(winrt::make_weak(tb));
         }
         if (tb.Text() != emoji) tb.Text(emoji);
+    }
+}
+
+// --- Tidy Tabs, after JaceThings/DiaTweaks' TidyTabs: a row at the top of the tab list with a line and
+// Tidy (a broom) and Clear buttons (Settings > Patches > Tidy Tabs: shown always or on hover, icons
+// only or with text, which buttons). On hover it stays shut until the pointer comes near the top of the
+// tabs, then eases open (0.2 s). Tidy asks Dia's chat to group the tabs (its GroupTabs tool makes,
+// names and colors the groups); meanwhile the line rolls as a wave, until the chat is done. Clear runs
+// Dia's own Close all tabs and confirms it.
+// Dia's own divider (TabSeparatorRow, "↓ Clear") only exists while Close All Tabs asks to confirm, so
+// the row is ours. It sits above Dia's TabListScrollViewer (moved down by the row's height), so it
+// stays put while the tabs scroll.
+static bool DiaIsForeground();
+static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
+                                     const std::function<bool(const mux::FrameworkElement&)>& want);
+static const wchar_t* kTidyPrompt =
+    L"Group my open tabs by topic using only their titles and addresses. Just make the groups; no need to reply.";
+static const double kTidyRowH = 24, kTidyInset = 11, kTidyBroom = 22, kTidyGap = 6;
+static const double kWaveLen = 10, kWaveAmp = 2.25, kWaveBox = 9;
+static const wchar_t kChatBusyGlyph = L'';  // the panel's send button while Dia's chat works (Stop)
+
+struct TidyLook {  // the Tidy Tabs options
+    bool always, text, tidy, clear;
+    std::wstring key() const { return std::wstring(text ? L"t" : L"i") + (tidy ? L"T" : L"") + (clear ? L"C" : L""); }
+};
+static TidyLook TidyOptions() {
+    auto b = Engine_TweakValue(L"tidyTabsButtons");
+    return {Engine_TweakValue(L"tidyTabsShow") == L"always", Engine_TweakValue(L"tidyTabsStyle") != L"icons",
+            b != L"clear", b != L"tidy"};
+}
+
+struct TidyRow {
+    winrt::weak_ref<muxc::ScrollViewer> scroll;  // Dia's TabListScrollViewer
+    winrt::weak_ref<muxc::Grid> root;            // Dia's RootGrid (holds the scroll viewer and our row)
+    winrt::weak_ref<muxc::Grid> row;
+    winrt::weak_ref<muxsh::Rectangle> line;
+    winrt::weak_ref<muxc::Canvas> waveBox;
+    winrt::weak_ref<muxsh::Path> wave;
+    winrt::weak_ref<muxc::Border> tidyBtn, clearBtn;
+    muxm::SolidColorBrush tidyTint{nullptr}, clearTint{nullptr};
+    std::wstring look;  // the options it was built with (rebuilt when they change)
+    bool hoverTidy = false, hoverClear = false;
+    muxm::Animation::Storyboard roll{nullptr};
+    mux::Thickness diaMargin{};
+    winrt::event_token moved{}, exited{};
+    double progress = 0, target = 0, waveW = -1;
+    ULONGLONG hideAt = 0;
+    bool hovered = false, waving = false;
+    bool eligible = false;  // enough tabs below the line for its buttons
+    bool strip = false;     // tabs on top: icons after Dia's + in the tab strip (no line)
+    muxm::Animation::Storyboard pulse{nullptr};  // (strip) the broom pulses while busy
+};
+static thread_local std::vector<std::shared_ptr<TidyRow>> t_tidyRows;
+static thread_local winrt::event_token t_tidyFrame{};
+static thread_local bool t_tidyAnimating = false;
+
+// The click's steps (run every frame while busy). The prompt goes to Dia's chat panel (what its Chat
+// button opens), kept out of sight: no tab, no command bar. Dia draws the chat in its own Chromium
+// window, placed where the panel (AssistantPanelHost) is in the layout. Before the Chat button is
+// pressed the panel is parked past the window's right edge (a negative right margin as wide as it is):
+// it keeps its size, so the chat loads and works as usual, but it takes no room and is clipped away,
+// so nothing shows and the page doesn't move. The prompt is typed into it, Dia answers as usual, and
+// once the groups land the panel's Close button shuts it and the panel gets its place back.
+struct TidyRun {
+    int step = 0;  // 0 idle, 1 panel opening, 2 new chat, 3 typing, 4 sent: waiting for the groups
+    ULONGLONG at = 0, clicked = 0, changedAt = 0;
+    std::wstring before;   // the tab list's shape once the chat is under way
+    bool opened = false;   // we opened the panel (so we close it)
+    bool squeezed = false; // the panel is parked off the window's edge
+    double parkW = 0;      // how far (its width, measured once)
+    int tries = 0;         // prompts typed (retried until the chat takes one)
+    bool seenWorking = false;  // Dia's chat was seen working on it
+    winrt::weak_ref<mux::FrameworkElement> panel;
+    winrt::weak_ref<mux::FrameworkElement> parked;  // what's parked: the panel's group (panel + resize handle)
+    wf::IInspectable diaMargin{nullptr}, diaWidth{nullptr};  // its own values, put back after
+    std::vector<std::pair<winrt::weak_ref<mux::FrameworkElement>, wf::IInspectable>> caps;  // page edges held at 0
+};
+static thread_local TidyRun t_tidy;
+static thread_local ULONGLONG t_tidyUnparkBy = 0;  // after a tidy: the panel stays parked until it has shut
+static thread_local ULONGLONG t_tidyQuietUntil = 0;  // toolbar focus ignored until then (see UpdateHiddenToolbar)
+static thread_local std::set<HWND> t_tidyMasked;     // chat windows given an empty region (never painted)
+static thread_local std::set<HWND> t_tidyWndsBefore; // page windows at the click
+
+static bool TidyBusy() { return t_tidy.step != 0; }
+bool Tidy_Quiet() { return TidyBusy() || t_tidyUnparkBy || GetTickCount64() < t_tidyQuietUntil; }
+
+// Dia's Chromium windows (pages, and the chat) in this process.
+template <class F>
+static void ForEachChromeWindow(F fn) {
+    EnumWindows([](HWND top, LPARAM l) -> BOOL {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(top, &pid);
+        if (pid != GetCurrentProcessId()) return TRUE;
+        EnumChildWindows(top, [](HWND h, LPARAM l) -> BOOL {
+            wchar_t cls[64];
+            GetClassNameW(h, cls, 64);
+            if (!wcscmp(cls, L"Chrome_WidgetWin_1")) (*(F*)l)(h);
+            return TRUE;
+        }, l);
+        return TRUE;
+    }, (LPARAM)&fn);
+}
+
+// The chat's window is new each time and Dia shows it where the panel would be for a moment as the
+// panel opens: an empty region keeps it from ever being painted, wherever it is. (Only chat-sized
+// windows that weren't there at the click, while the panel opens.)
+static void MaskNewChatWindows() {
+    ForEachChromeWindow([](HWND h) {
+        if (t_tidyWndsBefore.count(h) || t_tidyMasked.count(h)) return;
+        RECT r;
+        if (!GetWindowRect(h, &r) || r.right - r.left > 1000) return;
+        SetWindowRgn(h, CreateRectRgn(0, 0, 0, 0), TRUE);
+        t_tidyMasked.insert(h);
+    });
+}
+
+static void UnmaskChatWindows() {
+    for (HWND h : t_tidyMasked)
+        if (IsWindow(h)) SetWindowRgn(h, nullptr, TRUE);
+    t_tidyMasked.clear();
+}
+
+static void SendKeys(std::initializer_list<std::pair<WORD, bool>> keys);
+static mux::FrameworkElement FindByName(const mux::DependencyObject& under, const wchar_t* name);
+
+// All the text in an element.
+static std::wstring TextIn(const mux::DependencyObject& root) {
+    std::wstring s;
+    FirstIn(root, [&](const mux::FrameworkElement& fe) {
+        if (auto tb = fe.try_as<muxc::TextBlock>()) s += std::wstring(tb.Text()) + L"\n";
+        return false;
+    });
+    return s;
+}
+
+// The tab list's shape: rows, and how many are taller than a tab (groups). Changes when the groups land.
+static std::wstring TabListShape() {
+    std::wstring s;
+    for (auto h : FindNodes(L"RowsPanel"))
+        if (auto rows = Obj<muxc::StackPanel>(h); rows && rows.ActualHeight() > 0 && rows.Children().Size())
+            if (auto canvas = rows.Children().GetAt(0).try_as<muxc::Canvas>()) {
+                int n = 0, tall = 0;
+                for (auto const& c : canvas.Children()) {
+                    n++;
+                    if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.ActualHeight() > 40) tall++;
+                }
+                s += std::to_wstring(n) + L"/" + std::to_wstring(tall) + L";";
+            }
+    return s;
+}
+
+// Dia's Chat button (in each page toolbar). It lives in ChatButtonHost's content even while the
+// Hide Chat button tweak keeps that host collapsed, so it can still be pressed from here.
+static muxc::Button DiaChatButton() {
+    for (auto h : FindNodes(L"ChatButtonHost")) {
+        auto host = Obj<muxc::ContentControl>(h);
+        if (!host || !host.IsLoaded()) continue;
+        std::function<muxc::Button(wf::IInspectable const&)> find = [&](wf::IInspectable const& o) -> muxc::Button {
+            if (auto b = o.try_as<muxc::Button>(); b && b.Name() == L"ChatButton") return b;
+            if (auto p = o.try_as<muxc::Panel>())
+                for (auto const& c : p.Children())
+                    if (auto b = find(c)) return b;
+            if (auto bd = o.try_as<muxc::Border>()) return find(bd.Child());
+            return nullptr;
+        };
+        if (auto b = find(host.Content())) return b;
+    }
+    return nullptr;
+}
+
+// Presses a button, even a collapsed one: its host is shown (invisibly) for one layout pass.
+static bool PressButton(const muxc::Button& b, const char* what) {
+    if (!b) return Log("tidy: no %s button", what), false;
+    mux::UIElement hidden{nullptr};
+    for (mux::DependencyObject d = b; d; d = muxm::VisualTreeHelper::GetParent(d))
+        if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Visibility() == mux::Visibility::Collapsed) {
+            hidden = fe;
+            break;
+        }
+    double op = hidden ? hidden.Opacity() : 1;
+    bool ok = false;
+    try {
+        if (hidden) hidden.Opacity(0), hidden.Visibility(mux::Visibility::Visible), hidden.UpdateLayout();
+        winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
+        ok = true;
+    } catch (winrt::hresult_error const& e) {
+        Log("tidy: %s button: 0x%08lx", what, (unsigned long)e.code());
+    }
+    if (hidden) hidden.Visibility(mux::Visibility::Collapsed), hidden.Opacity(op);
+    return ok;
+}
+
+bool Tidy_PressChatButton() { return PressButton(DiaChatButton(), "Chat"); }  // (also `diatweaks probe CHATBUTTON`)
+
+// Dia's chat panel host (in the window the broom is in: the one on screen).
+static mux::FrameworkElement ChatPanelHost() {
+    for (auto h : FindNodes(L"AssistantPanelHost"))
+        if (auto fe = Obj<mux::FrameworkElement>(h); fe && fe.IsLoaded()) return fe;
+    return nullptr;
+}
+
+static bool ChatPanelShown(const mux::FrameworkElement& host) {
+    return host && host.Visibility() == mux::Visibility::Visible && host.ActualHeight() > 0;
+}
+
+static void Squeeze(const mux::FrameworkElement& host);
+// Dia sets the panel's margin itself as it opens and closes it; while parked, ours goes straight back,
+// before the frame is drawn (a frame with Dia's margin shows the chat and shrinks the page).
+static void Park(const mux::FrameworkElement& el);
+// Dia sets these itself as it opens and closes the panel; while parked, ours go straight back, before
+// the frame is drawn (a frame with Dia's values shows the chat and narrows the page).
+static void WatchParked(const mux::FrameworkElement& el) {
+    static thread_local winrt::weak_ref<mux::FrameworkElement> watched;
+    if (watched.get() == el) return;
+    watched = winrt::make_weak(el);
+    auto again = [](mux::DependencyObject const& o, mux::DependencyProperty const&) {
+        static thread_local bool busy = false;
+        auto fe = o.try_as<mux::FrameworkElement>();
+        if (busy || !fe || !t_tidy.squeezed || t_tidy.parked.get() != fe) return;
+        busy = true;
+        try {
+            Park(fe);
+        } catch (...) {
+        }
+        busy = false;
+    };
+    el.RegisterPropertyChangedCallback(mux::FrameworkElement::MarginProperty(), again);
+    el.RegisterPropertyChangedCallback(mux::FrameworkElement::WidthProperty(), again);
+}
+
+// Pinned to a width and pushed out by exactly that much: it keeps its size (the chat loads and works as
+// usual) but takes no room in the layout, past the window's right edge.
+static void Park(const mux::FrameworkElement& el) {
+    double w = t_tidy.parkW;
+    if (el.Width() != w) el.Width(w);
+    auto m = el.Margin();
+    if (std::abs(m.Right + w) > 0.5 || m.Left != 0) el.Margin({0, m.Top, -w, m.Bottom});
+    if (el.Opacity() != 0) el.Opacity(0);
+    if (el.IsHitTestVisible()) el.IsHitTestVisible(false);
+}
+
+// With the chat open Dia draws the page as a card, with gaps on its edges; with it shut they're all 0.
+// While parked they're held at 0, so the page keeps its size.
+static void CapPageEdges() {
+    if (!t_tidy.caps.empty()) return;
+    for (auto h : FindNodes(L"ContentHost")) {
+        auto host = Obj<mux::FrameworkElement>(h);
+        if (!host || !host.IsLoaded()) continue;
+        auto card = FirstIn(host, [](const mux::FrameworkElement& fe) {
+            auto g = fe.try_as<muxc::Grid>();
+            return g && g.RowDefinitions().Size() == 3 && g.ColumnDefinitions().Size() == 3;
+        }).try_as<muxc::Grid>();
+        if (!card) continue;
+        for (auto const& c : card.Children()) {
+            auto fe = c.try_as<mux::FrameworkElement>();
+            if (!fe) continue;
+            int r = muxc::Grid::GetRow(fe), col = muxc::Grid::GetColumn(fe);
+            auto dp = (r != 1 && col == 1)   ? mux::FrameworkElement::MaxHeightProperty()
+                      : (r == 1 && col != 1) ? mux::FrameworkElement::MaxWidthProperty()
+                                             : nullptr;
+            if (!dp) continue;
+            t_tidy.caps.push_back({winrt::make_weak(fe), fe.ReadLocalValue(dp)});
+            fe.SetValue(dp, box_value(0.0));
+        }
+    }
+}
+
+static void UncapPageEdges() {
+    for (auto& [w, v] : t_tidy.caps)
+        if (auto fe = w.get()) {
+            int r = muxc::Grid::GetRow(fe);
+            auto dp = r != 1 ? mux::FrameworkElement::MaxHeightProperty() : mux::FrameworkElement::MaxWidthProperty();
+            if (!v || v == mux::DependencyProperty::UnsetValue()) fe.ClearValue(dp);
+            else fe.SetValue(dp, v);
+        }
+    t_tidy.caps.clear();
+}
+
+static void Squeeze(const mux::FrameworkElement& host) {
+    if (!host) return;
+    if (!t_tidy.squeezed) {
+        mux::FrameworkElement el = host;
+        if (auto g = muxm::VisualTreeHelper::GetParent(host).try_as<mux::FrameworkElement>(); g && g.Name() == L"AssistantPanelGroup")
+            el = g;
+        t_tidy.panel = winrt::make_weak(host);
+        t_tidy.parked = winrt::make_weak(el);
+        t_tidy.diaMargin = el.ReadLocalValue(mux::FrameworkElement::MarginProperty());
+        t_tidy.diaWidth = el.ReadLocalValue(mux::FrameworkElement::WidthProperty());
+        t_tidy.parkW = 560;  // (Dia's panel is ~486 wide)
+        t_tidy.squeezed = true;
+        WatchParked(el);
+    }
+    if (auto el = t_tidy.parked.get()) Park(el);
+    CapPageEdges();
+}
+
+static void Unsqueeze() {
+    auto el = t_tidy.parked.get();
+    if (el && t_tidy.squeezed) {
+        auto put = [&](mux::DependencyProperty const& dp, wf::IInspectable const& v) {
+            if (!v || v == mux::DependencyProperty::UnsetValue()) el.ClearValue(dp);
+            else el.SetValue(dp, v);
+        };
+        t_tidy.squeezed = false;  // (first: the watchers leave Dia's values alone from here)
+        put(mux::FrameworkElement::MarginProperty(), t_tidy.diaMargin);
+        put(mux::FrameworkElement::WidthProperty(), t_tidy.diaWidth);
+        el.Opacity(1);
+        el.IsHitTestVisible(true);
+    }
+    t_tidy.squeezed = false;
+    UncapPageEdges();
+}
+
+// The chat's own window: Dia's Chromium page window that sits past the right edge of the window
+// (where the parked panel is).
+static HWND ChatWindow() {
+    struct Find {
+        HWND hit = nullptr;
+        RECT client{};
+    } f;
+    EnumWindows([](HWND top, LPARAM l) -> BOOL {
+        auto& f = *(Find*)l;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(top, &pid);
+        if (pid != GetCurrentProcessId() || !IsWindowVisible(top) || f.hit) return TRUE;
+        GetClientRect(top, &f.client);
+        MapWindowPoints(top, nullptr, (POINT*)&f.client, 2);
+        EnumChildWindows(top, [](HWND h, LPARAM l) -> BOOL {
+            auto& f = *(Find*)l;
+            wchar_t cls[64];
+            GetClassNameW(h, cls, 64);
+            RECT r;
+            if (wcscmp(cls, L"Chrome_RenderWidgetHostHWND") || !IsWindowVisible(h) || !GetWindowRect(h, &r)) return TRUE;
+            if (r.left >= f.client.right - 4 && r.right > r.left) f.hit = h;
+            return TRUE;
+        }, l);
+        return TRUE;
+    }, (LPARAM)&f);
+    return f.hit;
+}
+
+// The chat has a message in it: the panel's New chat button turns on (it's off on an empty chat).
+static bool ChatStarted() {
+    auto host = t_tidy.panel.get();
+    auto nb = host ? FindByName(host, L"NewChatButton").try_as<muxc::Button>() : nullptr;
+    return nb && nb.IsEnabled();
+}
+
+static bool ChatStarted();
+static bool PanelPromptIn();
+static bool PanelSend();
+std::string Tidy_DebugSend(bool post) {
+    std::ostringstream o;
+    HWND chat = ChatWindow();
+    o << "chat window " << (chat ? "found" : "missing");
+    if (post) {
+        t_tidy.panel = winrt::make_weak(ChatPanelHost());
+        o << "; prompt in " << (PanelPromptIn() ? "yes" : "no");
+        auto host = t_tidy.panel.get();
+        if (host) host.UpdateLayout();
+        o << "; sent " << (PanelSend() ? "yes" : "no (button off yet)");
+    }
+    o << "; chat started " << (ChatStarted() ? "yes" : "no");
+    return o.str();
+}
+
+std::string Tidy_Debug(bool open) {
+    auto host = ChatPanelHost();
+    if (!host) return "no chat panel";
+    std::ostringstream o;
+    if (open) {
+        t_tidy = {};
+        Squeeze(host);
+        o << "chat button " << (Tidy_PressChatButton() ? "pressed" : "failed");
+    } else {
+        if (ChatPanelShown(host)) PressButton(FindByName(host, L"CloseButton").try_as<muxc::Button>(), "Close");
+        Unsqueeze();
+        o << "closed";
+    }
+    auto m = host.Margin();
+    o << "; panel " << (ChatPanelShown(host) ? "shown" : "hidden") << " " << host.ActualWidth() << "x" << host.ActualHeight()
+      << " margin-right " << m.Right;
+    return o.str();
+}
+
+// The panel's own prompt box (a command bar inside the panel, part of Dia's UI, not the web page): the
+// prompt is put in it and its send button pressed directly. No keyboard or focus needed, so it works
+// while the panel is parked out of sight.
+static bool PanelPromptIn() {
+    auto host = t_tidy.panel.get();
+    auto bar = host ? FindByName(host, L"CommandBarContainerRoot") : nullptr;
+    auto box = bar ? FindByName(bar, L"QueryTextBox").try_as<muxc::RichEditBox>() : nullptr;
+    if (!box) return false;
+    box.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, kTidyPrompt);
+    box.Document().Selection().SetRange(INT_MAX, INT_MAX);
+    return true;
+}
+
+static bool PanelSend() {
+    auto host = t_tidy.panel.get();
+    auto bar = host ? FindByName(host, L"CommandBarContainerRoot") : nullptr;
+    auto send = bar ? FindByName(bar, L"SubmitButton").try_as<muxc::Button>() : nullptr;
+    if (!send || !send.IsEnabled()) return false;
+    try {
+        winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(send).Invoke();
+        return true;
+    } catch (winrt::hresult_error const& e) {
+        Log("tidy: send button: 0x%08lx", (unsigned long)e.code());
+        return false;
+    }
+}
+
+// Dia's chat is working on a reply: the panel's send button shows Stop instead of the send arrow.
+static bool ChatWorking() {
+    auto host = t_tidy.panel.get();
+    auto bar = host ? FindByName(host, L"CommandBarContainerRoot") : nullptr;
+    auto icon = bar ? FindByName(bar, L"SubmitButtonIcon").try_as<muxc::FontIcon>() : nullptr;
+    return icon && icon.Glyph().size() == 1 && icon.Glyph()[0] == kChatBusyGlyph;
+}
+
+// Dia chimes when a chat reply is done (a MediaPlayer in this process). While a tidy runs, this
+// process's own audio is muted on every output: only Dia's interface sounds, since web pages play
+// their sound from Chromium's separate audio process. Whatever was muted before stays muted.
+static thread_local std::vector<std::pair<winrt::com_ptr<ISimpleAudioVolume>, BOOL>> t_tidyMuted;
+static thread_local ULONGLONG t_tidyUnmuteAt = 0;
+
+static void MuteDiaSounds(bool mute) {
+    if (!mute) {
+        for (auto& [v, was] : t_tidyMuted)
+            if (v) v->SetMute(was, nullptr);
+        t_tidyMuted.clear();
+        t_tidyUnmuteAt = 0;
+        return;
+    }
+    if (!t_tidyMuted.empty()) return;
+    try {
+        auto en = winrt::create_instance<IMMDeviceEnumerator>(__uuidof(MMDeviceEnumerator));
+        winrt::com_ptr<IMMDeviceCollection> all;
+        if (FAILED(en->EnumAudioEndpoints(eRender, DEVICE_STATE_ACTIVE, all.put()))) return;
+        UINT n = 0;
+        all->GetCount(&n);
+        for (UINT i = 0; i < n; i++) {
+            winrt::com_ptr<IMMDevice> dev;
+            winrt::com_ptr<IAudioSessionManager> sm;
+            winrt::com_ptr<ISimpleAudioVolume> vol;
+            if (FAILED(all->Item(i, dev.put())) ||
+                FAILED(dev->Activate(__uuidof(IAudioSessionManager), CLSCTX_ALL, nullptr, sm.put_void())) ||
+                FAILED(sm->GetSimpleAudioVolume(nullptr, FALSE, vol.put())))
+                continue;
+            BOOL was = FALSE;
+            vol->GetMute(&was);
+            vol->SetMute(TRUE, nullptr);
+            t_tidyMuted.push_back({vol, was});
+        }
+    } catch (...) {
+    }
+}
+
+static void SetTidyBusy(bool busy);
+static void EnsureTidyFrames();
+static void EndTidy(const char* why) {
+    t_tidyUnmuteAt = GetTickCount64() + 2500;  // (the chime plays as the reply finishes)
+    Log("tidy: done (%s, %.1f s after the click)", why, (GetTickCount64() - t_tidy.clicked) / 1000.0);
+    bool closing = false;
+    if (t_tidy.opened)
+        if (auto host = t_tidy.panel.get(); host && ChatPanelShown(host))
+            closing = PressButton(FindByName(host, L"CloseButton").try_as<muxc::Button>(), "Close");
+    if (closing) t_tidyUnparkBy = GetTickCount64() + 2000;  // (put back once it's shut: no flash)
+    else Unsqueeze(), UnmaskChatWindows(), t_tidyQuietUntil = GetTickCount64() + 600;
+    t_tidy.step = 0;
+    SetTidyBusy(false);
+}
+
+// A short note under the Tidy button (shown for a few seconds), when a click can't do anything.
+static void FlashTidyTip(const wchar_t* text) {
+    extern void Tidy_ShowTip(const wchar_t* text);
+    Tidy_ShowTip(text);
+}
+
+static void StartTidy() {
+    if (TidyBusy() || t_tidyUnparkBy) return;
+    auto host = ChatPanelHost();
+    if (!host) return Log("tidy: no chat panel here");
+    if (ChatPanelShown(host)) return Log("tidy: your chat panel is open; close it to tidy");  // (yours: left alone)
+    t_tidy = {};
+    t_tidy.at = t_tidy.clicked = GetTickCount64();
+    t_tidyWndsBefore.clear();
+    ForEachChromeWindow([](HWND h) { t_tidyWndsBefore.insert(h); });
+    Squeeze(host);
+    if (!Tidy_PressChatButton()) {
+        Unsqueeze();
+        FlashTidyTip(L"Tidy needs a web page in front (Dia's chat is off on the New Tab page)");
+        return;
+    }
+    t_tidy.opened = true;
+    t_tidy.step = 1;
+    MuteDiaSounds(true);
+    SetTidyBusy(true);  // the wave starts right away
+    EnsureTidyFrames();
+    Log("tidy: clicked; opening the chat out of sight");
+}
+
+void Tidy_DebugRun() { StartTidy(); }
+
+static void RunTidySteps() {
+    if (!t_tidy.step) return;
+    ULONGLONG now = GetTickCount64(), since = now - t_tidy.at;
+    auto next = [&](int step) { t_tidy.step = step, t_tidy.at = now; };
+    auto host = t_tidy.panel.get();
+    if (host) Squeeze(host);  // (Dia may size it again)
+    if (now - t_tidy.clicked < 3000) MaskNewChatWindows();  // (the chat's window turns up ~0.4 s in)
+    switch (t_tidy.step) {
+    case 1:  // the panel is up: start a fresh chat
+        if (!host || !ChatPanelShown(host)) {
+            if (since > 2500) EndTidy("the chat panel didn't open");
+            return;
+        }
+        if (auto nb = FindByName(host, L"NewChatButton").try_as<muxc::Button>(); nb && nb.IsEnabled())
+            PressButton(nb, "New chat");  // (disabled when the panel's chat is already new)
+        return next(2);
+    case 2:  // the chat's text box is ready once its window is
+        if (since < 100) return;  // (after New chat, a frame for the panel to reset)
+        return next(3);
+    case 3:  // the prompt into the panel's box, then its send button (once Dia has enabled it)
+        if (!t_tidy.tries) {
+            if (!PanelPromptIn()) {
+                if (since > 3000) EndTidy("the panel's prompt box wasn't found");
+                return;
+            }
+            t_tidy.tries = 1;
+            t_tidy.at = now;
+            return;
+        }
+        if (t_tidy.tries == 1) {
+            if (!PanelSend()) {
+                if (since > 2000) EndTidy("the panel's send button stayed off");
+                return;
+            }
+            Log("tidy: sent to chat (%.2f s after the click)", (now - t_tidy.clicked) / 1000.0);
+            t_tidy.tries = 2;
+            t_tidy.before = TabListShape();
+            return next(4);
+        }
+        return;
+    case 4: {  // until Dia's chat is done (its send button shows Stop while it works): groups made and named
+        bool working = ChatWorking();
+        if (working) t_tidy.seenWorking = true, t_tidy.changedAt = 0;
+        else if (t_tidy.seenWorking) {
+            if (!t_tidy.changedAt) t_tidy.changedAt = now;
+            if (now - t_tidy.changedAt > 300) return EndTidy("chat done");
+        }
+        if (!t_tidy.seenWorking) {  // (never saw it work: fall back on the tab list changing, then settling)
+            auto shape = TabListShape();
+            if (shape != t_tidy.before) t_tidy.before = shape, t_tidy.changedAt = now;
+            if (since > 4000 && t_tidy.changedAt && now - t_tidy.changedAt > 1500) return EndTidy("groups made");
+        }
+        if (since > 120000) return EndTidy("timed out");
+        return;
+    }
+    }
+}
+
+// ---- Clear: exactly Dia's own right-click > Close All Tabs on the sidebar, confirmed. Dia builds that
+// menu only on a right-click, so one is sent to an empty spot of the sidebar (the pointer goes straight
+// back), the menu is hidden the moment it opens and its Close All Tabs run; Dia then shows its "↓ Clear"
+// line, which is pressed: the tabs close with Dia's own animation.
+static thread_local struct {
+    int phase = 0;  // 0 idle, 1 waiting for Dia's menu, 2 waiting for its "↓ Clear" line,
+                    // 3 tabs on top: closing the loose tabs one by one
+    int left = 0;
+    ULONGLONG at = 0;
+    POINT cursor{};
+    bool cursorBack = true;
+} t_clear;
+
+// Every tab row in the list (also those inside groups): Dia's row is a UserControl whose grid has five
+// columns (icon, ..., title, close button).
+static std::vector<mux::FrameworkElement> AllTabRows() {
+    std::vector<mux::FrameworkElement> out;
+    for (auto h : FindNodes(L"RowsPanel"))
+        if (auto rows = Obj<mux::FrameworkElement>(h); rows && rows.ActualHeight() > 0)
+            FirstIn(rows, [&](const mux::FrameworkElement& fe) {
+                if (auto uc = fe.try_as<muxc::UserControl>())
+                    if (auto g = uc.Content().try_as<muxc::Grid>(); g && g.ColumnDefinitions().Size() == 5)
+                        if (std::find(out.begin(), out.end(), fe) == out.end()) out.push_back(fe);
+                return false;
+            });
+    return out;
+}
+
+std::string Tidy_DebugFlyouts() {  // (`diatweaks probe FLYOUTS`: elements with a right-click menu)
+    std::ostringstream o;
+    Engine_ForEachNode([&](const NodeRef& r) {
+        auto el = Obj<mux::UIElement>(r.handle);
+        auto mf = el ? el.ContextFlyout().try_as<muxc::MenuFlyout>() : nullptr;
+        if (!mf) return;
+        o << N(r.type) << " \"" << N(r.name) << "\":";
+        for (auto const& it : mf.Items())
+            if (auto mi = it.try_as<muxc::MenuFlyoutItem>()) o << " [" << N(std::wstring(mi.Text())) << "]";
+        o << "\n";
+    });
+    return o.str();
+}
+
+static bool IsCloseAllTabs(const winrt::hstring& text) {
+    std::wstring t;
+    for (wchar_t c : std::wstring_view(text))
+        if (c != L'&') t += (wchar_t)towlower(c);
+    return t == L"close all tabs";
+}
+
+static void PutCursorBack() {
+    if (!t_clear.cursorBack) SetCursorPos(t_clear.cursor.x, t_clear.cursor.y), t_clear.cursorBack = true;
+}
+
+static void EndClear(const char* why) {
+    PutCursorBack();
+    Log("clear: %s", why);
+    t_clear.phase = 0;
+}
+
+// An empty spot of the sidebar, in screen pixels: under New Tab, or else on our line (whose line part
+// lets the pointer through to Dia's sidebar).
+static bool EmptySidebarSpot(POINT& out) {
+    for (auto& p : t_tidyRows) {
+        if (p->strip) {  // tabs on top: the empty strip right of our buttons
+            auto host = p->root.get();
+            auto row = p->row.get();
+            if (!host || !row || !host.XamlRoot()) continue;
+            double x = row.Margin().Left + row.ActualWidth() + 40;
+            if (x > host.ActualWidth() - 10) continue;
+            auto at = host.TransformToVisual(nullptr).TransformPoint({(float)x, (float)(host.ActualHeight() / 2)});
+            double scale = host.XamlRoot().RasterizationScale();
+            HWND top = GetForegroundWindow();
+            DWORD pid = 0;
+            GetWindowThreadProcessId(top, &pid);
+            if (pid != GetCurrentProcessId()) return false;
+            out = {(LONG)std::lround(at.X * scale), (LONG)std::lround(at.Y * scale)};
+            ClientToScreen(top, &out);
+            return true;
+        }
+        auto sv = p->scroll.get();
+        auto root = p->root.get();
+        if (!sv || !root || !sv.XamlRoot() || sv.ActualHeight() <= 0) continue;
+        double scale = sv.XamlRoot().RasterizationScale();
+        auto svTop = sv.TransformToVisual(nullptr).TransformPoint({0, 0});
+        double x = svTop.X + 40, y = -1;
+        auto rows = FirstIn(sv, [](const mux::FrameworkElement& fe) { return fe.Name() == L"RowsPanel"; }).try_as<muxc::StackPanel>();
+        if (rows && rows.Children().Size()) {
+            auto last = rows.Children().GetAt(rows.Children().Size() - 1).try_as<mux::FrameworkElement>();  // (New Tab)
+            if (last) {
+                double below = last.TransformToVisual(nullptr).TransformPoint({0, 0}).Y + last.ActualHeight() + 14;
+                if (below < svTop.Y + sv.ActualHeight() - 6) y = below;
+            }
+        }
+        if (y < 0) {
+            auto row = p->row.get();
+            if (!row || row.ActualHeight() < 8) continue;
+            y = row.TransformToVisual(nullptr).TransformPoint({0, 0}).Y + row.ActualHeight() / 2;
+            x = row.TransformToVisual(nullptr).TransformPoint({0, 0}).X + 30;
+        }
+        HWND top = GetForegroundWindow();
+        DWORD pid = 0;
+        GetWindowThreadProcessId(top, &pid);
+        if (pid != GetCurrentProcessId()) return false;
+        out = {(LONG)std::lround(x * scale), (LONG)std::lround(y * scale)};
+        ClientToScreen(top, &out);
+        return true;
+    }
+    return false;
+}
+
+// Tabs on top: Dia has no Close All Tabs there (only the sidebar's menu has it), so its effect is
+// done directly: every tab that isn't in a group (pinned ones aren't in the strip) is closed with its
+// own close button. A tab is in a group when it lies within the group's pill (Dia's z -1 elements).
+static mux::FrameworkElement NextLooseStripTab() {
+    for (auto h : FindNodes(L"TabStripContentHost")) {
+        auto host = Obj<mux::FrameworkElement>(h);
+        if (!host || !host.IsLoaded() || host.ActualWidth() <= 0) continue;
+        auto canvas = FirstIn(host, [](const mux::FrameworkElement& fe) {
+            auto c = fe.try_as<muxc::Canvas>();
+            return c && c.Children().Size() > 1 && fe.ActualHeight() > 0;
+        }).try_as<muxc::Canvas>();
+        if (!canvas) continue;
+        std::vector<std::pair<double, double>> groups;
+        std::vector<mux::FrameworkElement> tabs;
+        for (auto const& c : canvas.Children()) {
+            auto uc = c.try_as<muxc::UserControl>();
+            if (!uc || uc.ActualWidth() <= 0) continue;
+            double x = uc.TransformToVisual(canvas).TransformPoint({0, 0}).X;
+            if (muxc::Canvas::GetZIndex(uc) < 0) groups.push_back({x, x + uc.ActualWidth()});
+            else tabs.push_back(uc);
+        }
+        for (auto& t : tabs) {
+            double mid = t.TransformToVisual(canvas).TransformPoint({0, 0}).X + t.ActualWidth() / 2;
+            bool grouped = false;
+            for (auto& [a, b] : groups)
+                if (mid > a && mid < b) grouped = true;
+            if (!grouped) return t;
+        }
+    }
+    return nullptr;
+}
+
+static bool TabsOnTop() {
+    for (auto& p : t_tidyRows)
+        if (p->strip)
+            if (auto host = p->root.get(); host && host.IsLoaded() && host.ActualWidth() > 0) return true;
+    return false;
+}
+
+static void StartClear() {
+    if (t_clear.phase || TidyBusy()) return;
+    if (TabsOnTop()) {
+        t_clear.phase = 3;
+        t_clear.at = GetTickCount64();
+        t_clear.left = 200;
+        t_clear.cursorBack = true;
+        Log("clear: closing the loose tabs (tabs on top)");
+        return;
+    }
+    POINT at;
+    if (!EmptySidebarSpot(at)) return Log("clear: no empty spot of the sidebar to right-click");
+    GetCursorPos(&t_clear.cursor);
+    t_clear.cursorBack = false;
+    int vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    int vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    INPUT in[3] = {};
+    for (auto& i : in) i.type = INPUT_MOUSE;
+    in[0].mi.dx = (LONG)((at.x - vx) * 65535.0 / (vw - 1));
+    in[0].mi.dy = (LONG)((at.y - vy) * 65535.0 / (vh - 1));
+    in[0].mi.dwFlags = MOUSEEVENTF_MOVE | MOUSEEVENTF_ABSOLUTE | MOUSEEVENTF_VIRTUALDESK;
+    in[1].mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+    in[2].mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+    SendInput(3, in, sizeof(INPUT));
+    t_clear.phase = 1;
+    t_clear.at = GetTickCount64();
+    Log("clear: right-click at %ld,%ld", at.x, at.y);
+}
+
+static void RunClear() {
+    if (!t_clear.phase) return;
+    ULONGLONG since = GetTickCount64() - t_clear.at;
+    if (t_clear.phase == 3) {
+        auto tab = NextLooseStripTab();
+        if (!tab) return EndClear("done");
+        if (t_clear.left-- <= 0 || since > 15000) return EndClear("stopped (tabs left)");
+        auto close = FirstIn(tab, [](const mux::FrameworkElement& fe) {
+            return fe.try_as<muxc::Button>() && muxc::Grid::GetColumn(fe) == 4;
+        }).try_as<muxc::Button>();
+        if (!close || !PressButton(close, "Close tab")) EndClear("a tab wouldn't close");
+        return;
+    }
+    if (t_clear.phase == 1) {  // Dia's menu: hidden at once, its Close All Tabs run
+        for (auto& p : t_tidyRows) {
+            auto anchor = p->root.get();
+            if (!anchor || !anchor.XamlRoot()) continue;
+            for (auto const& pop : muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(anchor.XamlRoot())) {
+                auto child = pop.Child();
+                if (!child) continue;
+                auto item = FirstIn(child, [](const mux::FrameworkElement& fe) {
+                    auto mi = fe.try_as<muxc::MenuFlyoutItem>();
+                    return mi && IsCloseAllTabs(mi.Text());
+                }).try_as<muxc::MenuFlyoutItem>();
+                if (!item) continue;
+                child.Opacity(0);
+                PutCursorBack();
+                try {
+                    winrt::Microsoft::UI::Xaml::Automation::Peers::MenuFlyoutItemAutomationPeer(item).Invoke();
+                } catch (...) {
+                    pop.IsOpen(false);
+                    return EndClear("Close All Tabs wouldn't run");
+                }
+                t_clear.phase = 2;
+                t_clear.at = GetTickCount64();
+                return;
+            }
+        }
+        if (since > 1000) EndClear("Dia's menu didn't open");
+        return;
+    }
+    // Dia's "↓ Clear" line: press it.
+    for (auto h : FindNodes(L"CloseAllButton"))
+        if (auto b = Obj<muxc::Button>(h); b && b.IsLoaded() && b.ActualWidth() > 0) {
+            try {
+                winrt::Microsoft::UI::Xaml::Automation::Peers::ButtonAutomationPeer(b).Invoke();
+                return EndClear("done");
+            } catch (...) {
+            }
+        }
+    if (since > 2000) EndClear("Dia's Clear line didn't show");
+}
+
+// ---- the row
+static void RemoveTidyRow(TidyRow& r) {
+    if (auto root = r.root.get()) {
+        try {
+            root.PointerMoved(r.moved);
+            root.PointerExited(r.exited);
+        } catch (...) {
+        }
+        if (auto row = r.row.get()) {
+            uint32_t i;
+            if (root.Children().IndexOf(row, i)) root.Children().RemoveAt(i);
+        }
+    }
+    if (auto sv = r.scroll.get()) sv.Margin(r.diaMargin);
+    if (r.roll) r.roll.Stop();
+}
+
+// Jace's broom (SF Symbols has none): a 14-unit drawing tilted 25°, drawn at `size`.
+static mux::FrameworkElement BroomIcon(const muxm::Brush& brush, double size) {
+    auto c = muxc::Canvas();
+    c.Width(14), c.Height(14);
+    c.IsHitTestVisible(false);
+    muxm::RotateTransform tilt;
+    tilt.Angle(25), tilt.CenterX(7), tilt.CenterY(7);
+    c.RenderTransform(tilt);
+    auto handle = muxsh::Line();
+    handle.X1(7), handle.Y1(0.75), handle.X2(7), handle.Y2(7);
+    handle.StrokeThickness(1.5);
+    handle.StrokeStartLineCap(muxm::PenLineCap::Round), handle.StrokeEndLineCap(muxm::PenLineCap::Round);
+    handle.Stroke(brush);
+    auto band = muxsh::Rectangle();
+    band.Width(5), band.Height(2), band.RadiusX(0.75), band.RadiusY(0.75), band.Fill(brush);
+    muxc::Canvas::SetLeft(band, 4.5), muxc::Canvas::SetTop(band, 6.5);
+    auto bristles = muxsh::Polygon();
+    for (auto [x, y] : {std::pair{4.25, 9.0}, {9.75, 9.0}, {11.5, 13.5}, {2.5, 13.5}})
+        bristles.Points().Append({(float)x, (float)y});
+    bristles.Fill(brush);
+    c.Children().Append(handle), c.Children().Append(band), c.Children().Append(bristles);
+    auto v = muxc::Viewbox();
+    v.Width(size), v.Height(size);
+    v.Child(c);
+    v.IsHitTestVisible(false);
+    return v;
+}
+
+// The wave's path: a smooth sine (one cubic Bézier per half wave), a wavelength longer than the line so
+// it can roll.
+static muxm::Geometry WaveGeometry(double width) {
+    muxm::PathFigure fig;
+    double mid = kWaveBox / 2, half = kWaveLen / 2, k = 0.3642 * half;  // (control points for a sine half-wave)
+    fig.StartPoint({0, (float)mid});
+    for (double x = 0; x < width + kWaveLen; x += half) {
+        double peak = (std::fmod(x / half, 2.0) < 1 ? -1 : 1) * kWaveAmp * 1.0;
+        muxm::BezierSegment b;
+        b.Point1({(float)(x + k), (float)(mid + peak * 1.3)});
+        b.Point2({(float)(x + half - k), (float)(mid + peak * 1.3)});
+        b.Point3({(float)(x + half), (float)mid});
+        fig.Segments().Append(b);
+    }
+    fig.IsClosed(false);
+    muxm::PathGeometry g;
+    g.Figures().Append(fig);
+    return g;
+}
+
+// With text: Dia's "↓ Clear" look (tertiary text, secondary on hover). Icons only: Jace's broom look
+// (secondary, primary on hover, on a subtle background).
+static void StyleButton(const muxc::Border& b, const muxm::SolidColorBrush& tint, bool hovered, bool text) {
+    if (!b || !tint) return;
+    const wchar_t* key = text ? (hovered ? L"TextFillColorSecondaryBrush" : L"TextFillColorTertiaryBrush")
+                              : (hovered ? L"TextFillColorPrimaryBrush" : L"TextFillColorSecondaryBrush");
+    if (auto s = BrushRes(key, Rgba(255, 255, 255, hovered ? 0xc5 : 0x87)).try_as<muxm::SolidColorBrush>()) tint.Color(s.Color());
+    b.Background(!text && hovered ? BrushRes(L"SubtleFillColorSecondaryBrush", Rgba(255, 255, 255, 0x0f))
+                                  : muxm::Brush(muxm::SolidColorBrush(Rgba(0, 0, 0, 0))));
+}
+
+static void StyleButtons(TidyRow& r) {
+    bool text = r.look.size() && r.look[0] == L't';
+    StyleButton(r.tidyBtn.get(), r.tidyTint, r.hoverTidy, text);
+    StyleButton(r.clearBtn.get(), r.clearTint, r.hoverClear, text);
+    if (auto b = r.tidyBtn.get()) muxc::ToolTipService::SetToolTip(b, box_value(TidyBusy() ? L"Tidying…" : L"Tidy: group your tabs by topic"));
+}
+
+// The line becomes a rolling wave while busy (grown from flat, as Jace's morphs), and flattens back after.
+static void ShowWave(const std::shared_ptr<TidyRow>& p, bool on) {
+    auto& r = *p;
+    auto wave = r.wave.get();
+    auto line = r.line.get();
+    auto box = r.waveBox.get();
+    if (!wave || !line || !box || r.waving == on) return;
+    r.waving = on;
+    auto t = wave.RenderTransform().as<muxm::CompositeTransform>();
+    namespace ma = muxm::Animation;
+    if (on) {
+        line.Opacity(0);
+        box.Visibility(mux::Visibility::Visible);
+        if (!r.roll) {
+            r.roll = ma::Storyboard();
+            ma::DoubleAnimation roll;
+            roll.From(0.0), roll.To(-kWaveLen);
+            roll.Duration(mux::DurationHelper::FromTimeSpan(std::chrono::milliseconds(600)));
+            roll.RepeatBehavior(ma::RepeatBehaviorHelper::Forever());
+            ma::Storyboard::SetTarget(roll, t);
+            ma::Storyboard::SetTargetProperty(roll, L"TranslateX");
+            r.roll.Children().Append(roll);
+        }
+        r.roll.Begin();
+    }
+    ma::Storyboard grow;
+    ma::DoubleAnimation amp;
+    amp.To(on ? 1.0 : 0.0);
+    amp.Duration(mux::DurationHelper::FromTimeSpan(std::chrono::milliseconds(350)));
+    ma::CubicEase ease;
+    ease.EasingMode(ma::EasingMode::EaseInOut);
+    amp.EasingFunction(ease);
+    ma::Storyboard::SetTarget(amp, t);
+    ma::Storyboard::SetTargetProperty(amp, L"ScaleY");
+    grow.Children().Append(amp);
+    if (!on)
+        grow.Completed([weak = std::weak_ptr<TidyRow>(p)](auto&&, auto&&) {
+            auto q = weak.lock();
+            if (!q || q->waving) return;  // a new tidy started meanwhile
+            if (auto l = q->line.get()) l.Opacity(1);
+            if (auto b = q->waveBox.get()) b.Visibility(mux::Visibility::Collapsed);
+            if (q->roll) q->roll.Stop();
+        });
+    grow.Begin();
+}
+
+// (Tabs on top) no line for a wave: the broom pulses while Tidy works.
+static void PulseBroom(TidyRow& r, bool on) {
+    auto b = r.tidyBtn.get();
+    if (!b) return;
+    namespace ma = muxm::Animation;
+    if (!on) {
+        if (r.pulse) r.pulse.Stop();
+        b.Opacity(1);
+        return;
+    }
+    if (!r.pulse) {
+        r.pulse = ma::Storyboard();
+        ma::DoubleAnimation a;
+        a.From(1.0), a.To(0.3);
+        a.AutoReverse(true);
+        a.Duration(mux::DurationHelper::FromTimeSpan(std::chrono::milliseconds(550)));
+        a.RepeatBehavior(ma::RepeatBehaviorHelper::Forever());
+        ma::SineEase ease;
+        ease.EasingMode(ma::EasingMode::EaseInOut);
+        a.EasingFunction(ease);
+        ma::Storyboard::SetTarget(a, b);
+        ma::Storyboard::SetTargetProperty(a, L"Opacity");
+        r.pulse.Children().Append(a);
+    }
+    r.pulse.Begin();
+}
+
+static void EnsureTidyFrames();
+static void SetTidyBusy(bool busy) {
+    for (auto& p : t_tidyRows) {
+        ShowWave(p, busy);
+        if (p->strip) PulseBroom(*p, busy);
+        StyleButtons(*p);
+        if (busy) p->target = 1, p->hideAt = 0;
+        else p->hideAt = GetTickCount64() + 1500;  // a moment to see it settle, then it follows the pointer again
+    }
+    EnsureTidyFrames();
+}
+
+// One frame: each row eases toward open or shut (smoothstep, 0.2 s), and pending hides fire.
+static void UpdateHiddenToolbar();
+static void CheckUnpark() {
+    if (t_tidyUnmuteAt && GetTickCount64() > t_tidyUnmuteAt && !TidyBusy()) MuteDiaSounds(false);
+    if (!t_tidyUnparkBy || TidyBusy()) return;
+    auto host = t_tidy.panel.get();
+    if (!host || !ChatPanelShown(host) || GetTickCount64() > t_tidyUnparkBy) {
+        t_tidyUnparkBy = 0;
+        Unsqueeze();
+        UnmaskChatWindows();
+        t_tidyQuietUntil = GetTickCount64() + 600;  // (Dia hands focus back to the toolbar's Chat button)
+    }
+}
+
+// Open when: busy, Show = Always (with tabs to act on), or hovered.
+static double TidyWant(const TidyRow& r, bool always) {
+    return (TidyBusy() || (r.eligible && (always || r.hovered))) ? 1 : 0;
+}
+
+static bool TidyAnimate() {
+    bool more = false;
+    CheckUnpark();
+    RunClear();
+    if (t_clear.phase) more = true;
+    if (Tidy_Quiet()) {
+        UpdateHiddenToolbar();  // (Dia re-lays out the page as the panel opens and shuts: toolbar back at once)
+        if (!TidyBusy()) more = true;
+    }
+    if (t_tidy.step) {
+        RunTidySteps();
+        UpdateHiddenToolbar();
+        if (t_tidy.step && (t_tidy.step < 4 || GetTickCount64() - t_tidy.clicked < 3000)) more = true;  // (then on the tick)
+    }
+    ULONGLONG now = GetTickCount64();
+    static thread_local ULONGLONG last = 0;
+    double dt = last && now > last ? (std::min)(0.05, (now - last) / 1000.0) : 1.0 / 60;
+    last = now;
+    bool always = TidyOptions().always;
+    for (auto& p : t_tidyRows) {
+        auto& r = *p;
+        if (r.hideAt && now >= r.hideAt) r.hideAt = 0, r.target = TidyWant(r, always);
+        if (r.hideAt) more = true;
+        if (std::abs(r.progress - r.target) > 0.001) {
+            double step = dt / 0.2;
+            r.progress = r.target > r.progress ? (std::min)(r.target, r.progress + step) : (std::max)(r.target, r.progress - step);
+            more = true;
+        }
+        double e = r.progress * r.progress * (3 - 2 * r.progress);
+        if (r.strip) {
+            if (auto row = r.row.get()) {
+                if (std::abs(row.Opacity() - e) > 0.001) row.Opacity(e);
+                row.IsHitTestVisible(e > 0.5);
+                auto vis = e > 0.001 ? mux::Visibility::Visible : mux::Visibility::Collapsed;
+                if (row.Visibility() != vis) row.Visibility(vis);
+            }
+            continue;
+        }
+        double h = std::round(kTidyRowH * e);
+        if (auto row = r.row.get()) {
+            if (std::abs(row.Height() - h) > 0.1) row.Height(h);
+            if (std::abs(row.Opacity() - e) > 0.001) row.Opacity(e);
+            auto vis = h >= 1 ? mux::Visibility::Visible : mux::Visibility::Collapsed;
+            if (row.Visibility() != vis) row.Visibility(vis);
+        }
+        if (auto sv = r.scroll.get()) {
+            mux::Thickness m = r.diaMargin;
+            m.Top += h;
+            if (std::abs(sv.Margin().Top - m.Top) > 0.1) sv.Margin(m);
+        }
+    }
+    if (!more) last = 0;
+    return more;
+}
+
+static void EnsureTidyFrames() {
+    if (t_tidyAnimating) return;
+    t_tidyAnimating = true;
+    t_tidyFrame = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        bool more = false;
+        try {
+            more = TidyAnimate();
+        } catch (...) {
+        }
+        if (!more) {
+            muxm::CompositionTarget::Rendering(t_tidyFrame);
+            t_tidyAnimating = false;
+        }
+    });
+}
+
+static size_t TabsBelow(const muxc::ScrollViewer& sv) {
+    auto rows = FirstIn(sv, [](const mux::FrameworkElement& fe) { return fe.Name() == L"RowsPanel"; }).try_as<muxc::StackPanel>();
+    if (!rows || !rows.Children().Size()) return 0;
+    auto canvas = rows.Children().GetAt(0).try_as<muxc::Canvas>();
+    return canvas ? canvas.Children().Size() : 0;
+}
+
+// Near the top of the tabs (Jace: from 6 above the list to 4 into it, plus the row while it's open).
+static bool InTidyZone(TidyRow& r, mux::Input::PointerRoutedEventArgs const& e) {
+    auto sv = r.scroll.get();
+    auto root = r.root.get();
+    if (!sv || !root) return false;
+    auto pt = e.GetCurrentPoint(root).Position();
+    auto top = sv.TransformToVisual(root).TransformPoint({0, 0});
+    double rowTop = top.Y - (sv.Margin().Top - r.diaMargin.Top);
+    double open = kTidyRowH * r.progress;
+    return pt.X >= top.X && pt.X <= top.X + sv.ActualWidth() && pt.Y >= rowTop - 6 && pt.Y <= rowTop + 4 + open;
+}
+
+// One button: an icon, and its label when the options say so.
+static muxc::Border TidyButton(const std::shared_ptr<TidyRow>& rec, bool isTidy, bool text) {
+    std::weak_ptr<TidyRow> weak = rec;
+    auto tint = muxm::SolidColorBrush(Rgba(255, 255, 255, 0x87));
+    (isTidy ? rec->tidyTint : rec->clearTint) = tint;
+    auto b = muxc::Border();
+    b.CornerRadius({6, 6, 6, 6});
+    b.VerticalAlignment(mux::VerticalAlignment::Center);
+    b.Background(muxm::SolidColorBrush(Rgba(0, 0, 0, 0)));
+    auto content = muxc::StackPanel();
+    content.Orientation(muxc::Orientation::Horizontal);
+    content.Spacing(4);
+    content.HorizontalAlignment(mux::HorizontalAlignment::Center);
+    content.VerticalAlignment(mux::VerticalAlignment::Center);
+    if (isTidy) {
+        content.Children().Append(BroomIcon(tint, text ? 11 : 14));
+    } else {
+        auto arrow = muxc::FontIcon();
+        arrow.Glyph(L"");  // ↓, as Dia's Clear
+        arrow.FontFamily(muxm::FontFamily(L"Segoe Fluent Icons"));
+        arrow.FontSize(text ? 10 : 13);
+        arrow.Foreground(tint);
+        arrow.VerticalAlignment(mux::VerticalAlignment::Center);
+        content.Children().Append(arrow);
+    }
+    if (text) {
+        auto label = muxc::TextBlock();
+        label.Text(isTidy ? L"Tidy" : L"Clear");
+        label.FontSize(12);
+        label.Foreground(tint);
+        label.VerticalAlignment(mux::VerticalAlignment::Center);
+        content.Children().Append(label);
+        b.Padding({4, 2, 4, 2});
+    } else {
+        b.Width(kTidyBroom), b.Height(kTidyBroom);
+    }
+    b.Child(content);
+    winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetName(b, isTidy ? L"Tidy Tabs" : L"Clear tabs");
+    if (!isTidy) muxc::ToolTipService::SetToolTip(b, box_value(L"Clear: close your open tabs"));
+    b.PointerEntered([weak, isTidy](auto&&, auto&&) {
+        if (auto p = weak.lock()) (isTidy ? p->hoverTidy : p->hoverClear) = true, StyleButtons(*p);
+    });
+    b.PointerExited([weak, isTidy](auto&&, auto&&) {
+        if (auto p = weak.lock()) (isTidy ? p->hoverTidy : p->hoverClear) = false, StyleButtons(*p);
+    });
+    b.Tapped([isTidy](auto&&, mux::Input::TappedRoutedEventArgs const& e) {
+        e.Handled(true);
+        if (isTidy) StartTidy();
+        else StartClear(), EnsureTidyFrames();
+    });
+    (isTidy ? rec->tidyBtn : rec->clearBtn) = winrt::make_weak(b);
+    return b;
+}
+
+static std::shared_ptr<TidyRow> BuildTidyRow(const muxc::ScrollViewer& sv, const muxc::Grid& root, const TidyLook& look) {
+    auto rec = std::make_shared<TidyRow>();
+    rec->scroll = winrt::make_weak(sv);
+    rec->root = winrt::make_weak(root);
+    rec->diaMargin = sv.Margin();
+    rec->look = look.key();
+    std::weak_ptr<TidyRow> weak = rec;
+
+    auto row = muxc::Grid();
+    row.Name(L"diatweaksTidyRow");
+    row.Height(0);
+    row.Opacity(0);
+    row.Visibility(mux::Visibility::Collapsed);
+    row.VerticalAlignment(mux::VerticalAlignment::Top);
+    row.Margin({0, rec->diaMargin.Top, 0, 0});
+    muxc::Grid::SetRow(row, muxc::Grid::GetRow(sv));
+    muxc::Grid::SetColumn(row, muxc::Grid::GetColumn(sv));
+    row.SizeChanged([](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {  // shut, nothing pokes out
+        if (auto g = s.try_as<muxc::Grid>()) {
+            muxm::RectangleGeometry c;
+            c.Rect({0, 0, e.NewSize().Width, e.NewSize().Height});
+            g.Clip(c);
+        }
+    });
+    muxc::ColumnDefinition c0, c1;
+    c0.Width(mux::GridLengthHelper::FromValueAndType(1, mux::GridUnitType::Star));
+    c1.Width(mux::GridLengthHelper::Auto());
+    row.ColumnDefinitions().Append(c0), row.ColumnDefinitions().Append(c1);
+
+    // The line (Dia's divider color), with the wave over it.
+    auto lineArea = muxc::Grid();
+    lineArea.Margin({kTidyInset, 0, kTidyGap, 0});
+    lineArea.IsHitTestVisible(false);
+    auto line = muxsh::Rectangle();
+    line.Height(1);
+    line.VerticalAlignment(mux::VerticalAlignment::Center);
+    line.Fill(BrushRes(L"DividerStrokeColorDefaultBrush", Rgba(255, 255, 255, 0x1a)));
+    lineArea.Children().Append(line);
+    auto box = muxc::Canvas();
+    box.Height(kWaveBox);
+    box.VerticalAlignment(mux::VerticalAlignment::Center);
+    box.Visibility(mux::Visibility::Collapsed);
+    auto wave = muxsh::Path();
+    wave.Stroke(BrushRes(L"TextFillColorTertiaryBrush", Rgba(255, 255, 255, 0x87)));
+    wave.StrokeThickness(1.25);
+    wave.StrokeStartLineCap(muxm::PenLineCap::Round), wave.StrokeEndLineCap(muxm::PenLineCap::Round);
+    muxm::CompositeTransform wt;
+    wt.CenterY(kWaveBox / 2);
+    wt.ScaleY(0);
+    wave.RenderTransform(wt);
+    box.Children().Append(wave);
+    box.SizeChanged([weak](wf::IInspectable const& s, mux::SizeChangedEventArgs const& e) {
+        auto p = weak.lock();
+        auto c = s.try_as<muxc::Canvas>();
+        if (!p || !c) return;
+        float w = e.NewSize().Width;
+        muxm::RectangleGeometry g;
+        g.Rect({0, 0, w, (float)kWaveBox});
+        c.Clip(g);
+        if (std::abs(w - p->waveW) > 1)
+            if (auto path = p->wave.get()) path.Data(WaveGeometry(w)), p->waveW = w;
+    });
+    lineArea.Children().Append(box);
+    row.Children().Append(lineArea);
+
+    // The buttons.
+    auto buttons = muxc::StackPanel();
+    buttons.Orientation(muxc::Orientation::Horizontal);
+    buttons.Spacing(look.text ? 6 : 2);
+    buttons.VerticalAlignment(mux::VerticalAlignment::Center);
+    buttons.Margin({0, 0, kTidyInset - 4, 0});
+    if (look.tidy) buttons.Children().Append(TidyButton(rec, true, look.text));
+    if (look.clear) buttons.Children().Append(TidyButton(rec, false, look.text));
+    muxc::Grid::SetColumn(buttons, 1);
+    row.Children().Append(buttons);
+
+    root.Children().Append(row);
+    rec->row = winrt::make_weak(row);
+    rec->line = winrt::make_weak(line);
+    rec->waveBox = winrt::make_weak(box);
+    rec->wave = winrt::make_weak(wave);
+    StyleButtons(*rec);
+
+    // Hover: open near the top of the tabs, shut 150 ms after the pointer leaves (busy keeps it open).
+    rec->moved = root.PointerMoved([weak](auto&&, mux::Input::PointerRoutedEventArgs const& e) {
+        auto p = weak.lock();
+        if (!p || !Engine_TweakOn(L"tidyTabs")) return;
+        bool in = InTidyZone(*p, e);
+        if (in == p->hovered) return;
+        p->hovered = in;
+        if (in && p->eligible) p->hideAt = 0, p->target = 1;
+        else if (!in && !p->hideAt) p->hideAt = GetTickCount64() + 150;
+        EnsureTidyFrames();
+    });
+    rec->exited = root.PointerExited([weak](auto&&, auto&&) {
+        auto p = weak.lock();
+        if (p && p->hovered) p->hovered = false, p->hideAt = GetTickCount64() + 150, EnsureTidyFrames();
+    });
+    Log("tidy: row added (%s)", N(rec->look).c_str());
+    return rec;
+}
+
+void Tidy_ShowTip(const wchar_t* text) {
+    for (auto& p : t_tidyRows) {
+        auto b = p->tidyBtn.get();
+        if (!b || !b.IsLoaded() || b.ActualWidth() <= 0) continue;
+        muxc::ToolTip tip;
+        tip.Content(box_value(text));
+        muxc::ToolTipService::SetToolTip(b, tip);
+        tip.IsOpen(true);
+        auto weak = winrt::make_weak(tip);
+        auto timer = b.DispatcherQueue().CreateTimer();
+        timer.Interval(std::chrono::milliseconds(3000));
+        timer.IsRepeating(false);
+        timer.Tick([weak](auto&&, auto&&) {
+            if (auto t = weak.get()) t.IsOpen(false);
+        });
+        timer.Start();
+        static thread_local std::vector<winrt::Microsoft::UI::Dispatching::DispatcherQueueTimer> keep;
+        keep.push_back(timer);
+        if (keep.size() > 4) keep.erase(keep.begin());
+    }
+}
+
+// Tabs on top: the buttons, icons only (no room for text), right after Dia's + in the tab strip.
+static mux::FrameworkElement StripPlusButton(const muxc::Grid& host) {
+    return FirstIn(host, [](const mux::FrameworkElement& fe) {
+        if (!fe.try_as<muxc::Button>()) return false;
+        auto icon = FirstIn(fe, [](const mux::FrameworkElement& x) { return (bool)x.try_as<muxc::FontIcon>(); }).try_as<muxc::FontIcon>();
+        return icon && icon.Glyph() == L"\uE710";  // (the + glyph)
+    });
+}
+
+static std::wstring StripLook(const TidyLook& look) {
+    return L"i" + std::wstring(look.tidy ? L"T" : L"") + (look.clear ? L"C" : L"");
+}
+
+static std::shared_ptr<TidyRow> BuildTidyStrip(const muxc::Grid& host, const TidyLook& look) {
+    auto rec = std::make_shared<TidyRow>();
+    rec->strip = true;
+    rec->root = winrt::make_weak(host);
+    rec->look = StripLook(look);
+    std::weak_ptr<TidyRow> weak = rec;
+    auto row = muxc::Grid();
+    row.Name(L"diatweaksTidyStrip");
+    row.HorizontalAlignment(mux::HorizontalAlignment::Left);
+    row.VerticalAlignment(mux::VerticalAlignment::Center);
+    row.Opacity(0);
+    row.Visibility(mux::Visibility::Collapsed);
+    auto buttons = muxc::StackPanel();
+    buttons.Orientation(muxc::Orientation::Horizontal);
+    buttons.Spacing(2);
+    if (look.tidy) buttons.Children().Append(TidyButton(rec, true, false));
+    if (look.clear) buttons.Children().Append(TidyButton(rec, false, false));
+    row.Children().Append(buttons);
+    host.Children().Append(row);
+    rec->row = winrt::make_weak(row);
+    StyleButtons(*rec);
+    // Hover: anywhere on the tab strip.
+    rec->moved = host.PointerMoved([weak](auto&&, auto&&) {
+        auto p = weak.lock();
+        if (!p || p->hovered) return;
+        p->hovered = true, p->hideAt = 0;
+        if (p->eligible) p->target = 1;
+        EnsureTidyFrames();
+    });
+    rec->exited = host.PointerExited([weak](auto&&, auto&&) {
+        auto p = weak.lock();
+        if (p && p->hovered) p->hovered = false, p->hideAt = GetTickCount64() + 300, EnsureTidyFrames();
+    });
+    Log("tidy: strip added (%s)", N(rec->look).c_str());
+    return rec;
+}
+
+static void PlaceTidyStrip(TidyRow& r) {
+    auto host = r.root.get();
+    auto row = r.row.get();
+    if (!host || !row) return;
+    auto plus = StripPlusButton(host);
+    if (!plus || plus.ActualWidth() <= 0) {
+        r.eligible = false;
+        return;
+    }
+    double x = plus.TransformToVisual(host).TransformPoint({(float)plus.ActualWidth(), 0}).X + 2;
+    double w = row.ActualWidth() > 0 ? row.ActualWidth() : 48;
+    r.eligible = x + w <= host.ActualWidth() - 4;  // (no room left on the strip: hidden)
+    if (std::abs(row.Margin().Left - x) > 0.5) row.Margin({x, 0, 0, 0});
+}
+
+static void UpdateTidyTabs() {
+    RunTidySteps();
+    CheckUnpark();
+    bool on = Engine_TweakOn(L"tidyTabs");
+    auto look = TidyOptions();
+    for (auto it = t_tidyRows.begin(); it != t_tidyRows.end();) {
+        auto& r = **it;
+        auto host = r.root.get();
+        bool gone = r.strip ? (!host || !host.IsLoaded() || host.ActualWidth() <= 0) : !r.scroll.get();
+        bool stale = gone || !r.row.get() || !host || (r.look != (r.strip ? StripLook(look) : look.key()) && !TidyBusy());
+        if (!on || stale) {
+            RemoveTidyRow(r);
+            it = t_tidyRows.erase(it);
+        } else
+            ++it;
+    }
+    if (!on) return;
+    // Dia's own divider is up (Close All Tabs is asking): ours shuts.
+    bool diaLine = false;
+    for (auto h : FindNodes(L"TabSeparatorRow"))
+        if (auto fe = Obj<mux::FrameworkElement>(h); fe && fe.Visibility() == mux::Visibility::Visible && fe.ActualHeight() > 0)
+            diaLine = true;
+    for (auto h : FindNodes(L"TabListScrollViewer")) {
+        auto sv = Obj<muxc::ScrollViewer>(h);
+        auto root = sv ? muxm::VisualTreeHelper::GetParent(sv).try_as<muxc::Grid>() : nullptr;
+        if (!root || root.Name() != L"RootGrid") continue;
+        auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->scroll.get() == sv; });
+        if (it == t_tidyRows.end()) {
+            t_tidyRows.push_back(BuildTidyRow(sv, root, look));
+            it = std::prev(t_tidyRows.end());
+        }
+        auto& r = **it;
+        // Any tabs in the list, loose or in groups (Clear and a new Tidy both apply to grouped tabs too).
+        r.eligible = !diaLine && (TabsBelow(sv) > 0 || !AllTabRows().empty());
+        double want = TidyWant(r, look.always);
+        if (want != r.target && !r.hideAt) r.target = want, EnsureTidyFrames();
+    }
+    for (auto h : FindNodes(L"TabStripContentHost")) {
+        auto host = Obj<muxc::Grid>(h);
+        if (!host || !host.IsLoaded() || host.ActualWidth() <= 0) continue;
+        auto it = std::find_if(t_tidyRows.begin(), t_tidyRows.end(), [&](auto& p) { return p->strip && p->root.get() == host; });
+        if (it == t_tidyRows.end()) {
+            t_tidyRows.push_back(BuildTidyStrip(host, look));
+            it = std::prev(t_tidyRows.end());
+        }
+        auto& r = **it;
+        PlaceTidyStrip(r);
+        double want = TidyWant(r, look.always);
+        if (want != r.target && !r.hideAt) r.target = want, EnsureTidyFrames();
     }
 }
 
@@ -3748,7 +5143,10 @@ static void UpdateHiddenToolbar() {
             a.to = 0;
         }
         auto barEl = a.bar.get();
-        bool focused = barEl && FocusWithin(barEl);  // typing in the address bar (Ctrl+L) keeps it out
+        extern bool Tidy_Quiet();
+        // Typing in the address bar (Ctrl+L) keeps it out; not while Tidy Tabs works its hidden chat (its
+        // Chat button, in the toolbar, takes focus as the chat opens and gets it back as it closes).
+        bool focused = barEl && FocusWithin(barEl) && !Tidy_Quiet();
         bool want = !hide || show || focused;
         double h = BarHeight(a);
         double target = want ? 0 : -h;
@@ -4017,6 +5415,7 @@ bool Ui_Tick() {
         UpdateNewTabMode();
         Peek_Tick();
         UpdateHoverCards();
+        UpdateTidyTabs();
         if (tick % 3 == 0) {
             UpdateWindowMaterial();
             UpdateToolbarLook();

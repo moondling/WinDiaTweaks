@@ -44,6 +44,8 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Profile emoji | Shows an emoji for this profile at the top of the sidebar |
 | Don't pop up downloads | Stops the downloads list from opening by itself for each download |
 | Translucent sidebar | Lets the page show through the sidebar when it floats over the page |
+| **Tidy Tabs** | |
+| Tidy Tabs ✨ | A line at the top of your tabs with **Tidy** (a broom) and **Clear**, as in DiaTweaks on macOS and Arc. Tidy asks Dia's chat, out of sight and without its chime, to group your open tabs by topic; Dia makes, names and colors the groups while the line rolls as a wave. Clear does Dia's own Close All Tabs (as from a right-click on the sidebar) in one click. With tabs on top, the two show as icons after the + in the tab bar. Options: show it always or on hover, icons only or with text, Tidy and Clear, Tidy only or Clear only |
 | **Window** | |
 | Hide window buttons | Hides minimize, maximize and close (Alt+F4 still closes) |
 | Window material | Mica, Mica Alt or Acrylic behind the tabs and sidebar |

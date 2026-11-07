@@ -1,5 +1,6 @@
 # Build output and your own settings/logs
 bin/
+dist/
 
 # Made from the Dia installed on your PC by gen-winrt.cmd. Never commit: it's Dia's.
 winmd/

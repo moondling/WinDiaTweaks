@@ -691,6 +691,9 @@ static bool Capture(std::wstring cmdline, std::string& out) {
 // build: its version is whatever was built, so it isn't offered releases and is never pulled.
 // Returns why it is one, or nothing for a release or a clean main.
 static std::wstring DevBuildReason() {
+    // A transferable custom build must keep its toolbar patches when an official release appears.
+    if (GetFileAttributesW((g_dir + L"\\custom-build.txt").c_str()) != INVALID_FILE_ATTRIBUTES)
+        return L"a custom toolbar package; update using a newer custom installer";
     std::wstring root = RepoRoot();
     if (root.empty()) return {};
     std::wstring git = L"git -C \"" + root + L"\" ";
@@ -1459,7 +1462,7 @@ static int CmdInstall(int argc, wchar_t** argv) {
     SHCreateDirectoryExW(nullptr, to.c_str(), nullptr);
     CloseDia();
     StopWatcher();  // it keeps DiaLauncher.exe in use
-    for (const wchar_t* name : {L"diatweaks.exe", L"DiaLauncher.exe", L"DiaTweaksTap.dll", L"uninstall.cmd", L"LICENSE"}) {
+    for (const wchar_t* name : {L"diatweaks.exe", L"DiaLauncher.exe", L"DiaTweaksTap.dll", L"uninstall.cmd", L"LICENSE", L"custom-build.txt"}) {
         std::wstring from = g_dir + L"\\" + name;
         if (GetFileAttributesW(from.c_str()) == INVALID_FILE_ATTRIBUTES) continue;
         if (!Replace(from, to + L"\\" + name)) {

@@ -38,9 +38,11 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide sidebar button | Hides the sidebar button |
 | Hide tab search button ✨ | Hides the ⌄ button at the top of the sidebar |
 | Hide Chat button | Hides the Chat button |
+| Pinned extensions shown ✨ | Shows up to 6, 8, 10, 12 or 16 pinned extensions by the address bar instead of Dia's 4 (the rest stay in the extensions menu). Applies the next time Dia opens; after a change, a Reopen Dia button appears next to it |
 | Hide page loading animation ✨ | Hides the orange bar that sweeps across the address field while a page loads |
 | **New Tab** | |
 | Clean search box | Turns the New Tab box and the Ctrl+L / Ctrl+T bar into one search line: no "Add tabs or files" row, the send button sits at the end of the line |
+| Hide history suggestions | Leaves pages you've visited and past searches out of the address and command bar suggestions; searching, search suggestions and open tabs still show. Your history itself is kept |
 | **Sidebar & tab bar** | |
 | Hide pinned tab border | Removes the colored border around the selected pinned tab |
 | Hide tab hover card ✨ | Stops the card with the page title, site and buttons from popping up when you hover a tab or pinned tab |

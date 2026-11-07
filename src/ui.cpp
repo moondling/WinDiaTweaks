@@ -424,6 +424,19 @@ struct BoundChoice {
 };
 static thread_local std::vector<BoundChoice> t_choiceSwitches;
 
+// "Reopen Dia" buttons of tweaks that apply when Dia next opens: shown once the setting changes.
+struct BoundRestart {
+    std::wstring key;
+    winrt::weak_ref<muxc::Button> button;
+};
+static thread_local std::vector<BoundRestart> t_restartButtons;
+static void SyncRestartButtons() {
+    for (auto& r : t_restartButtons)
+        if (auto b = r.button.get())
+            b.Visibility(Engine_NeedsRestart(r.key) ? mux::Visibility::Visible : mux::Visibility::Collapsed);
+}
+static bool RunToolWindow(const std::wstring& args, bool hidden = false);
+
 // A tweak whose choices include "off" is switched by its drop-down alone (no On/Off switch).
 static bool ChoiceIsSwitch(const TweakInfo& t) {
     for (auto& [val, label] : t.choices)
@@ -552,6 +565,7 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
             }
             if (choiceSwitch && v == L"off") Engine_SetTweak(key, false, nullptr);
             else Engine_SetTweak(key, choiceSwitch || keepOn || Engine_TweakOn(key), &v);
+            SyncRestartButtons();
         });
         if (choiceSwitch) {
             box.IsEnabled(!Engine_SafeMode());
@@ -574,6 +588,23 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
         controls.Children().Append(box);
     }
 
+    if (t.restart) {
+        muxc::Button reopen;
+        reopen.Content(box_value(L"Reopen Dia"));
+        if (auto style = Resource(L"AccentButtonStyle").try_as<mux::Style>()) reopen.Style(style);
+        reopen.Visibility(Engine_NeedsRestart(key) ? mux::Visibility::Visible : mux::Visibility::Collapsed);
+        reopen.Click([](wf::IInspectable const& s, auto&&) {
+            auto b = s.as<muxc::Button>();
+            if (!RunToolWindow(L"restart", true)) return;
+            b.Content(box_value(L"Reopening..."));
+            b.IsEnabled(false);
+        });
+        reopen.Name(L"diatweaksReopen_" + key);
+        winrt::Microsoft::UI::Xaml::Automation::AutomationProperties::SetAutomationId(reopen, L"reopen_" + key);
+        controls.Children().InsertAt(0, reopen);
+        t_restartButtons.push_back({key, winrt::make_weak(reopen)});
+    }
+
     if (choiceSwitch || t.noSwitch) {
         muxc::Grid::SetColumn(controls, 2);
         row.Children().Append(controls);
@@ -590,6 +621,7 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
     sw.Toggled([key](wf::IInspectable const& s, auto&&) {
         if (t_syncing) return;
         Engine_SetTweak(key, s.as<muxc::ToggleSwitch>().IsOn(), nullptr);
+        SyncRestartButtons();
     });
     t_toggles.push_back({key, winrt::make_weak(sw)});
     controls.Children().Append(sw);
@@ -853,7 +885,8 @@ static void MaybeAutoCheck() {
 
 // Runs `diatweaks <args>` in its own console window. Through `detach`, so the window's process is
 // started outside Dia's package: Dia's package would close it together with Dia.
-static bool RunToolWindow(const std::wstring& args) {
+// hidden: runs DiaLauncher.exe (the same program without a console) instead, with no window at all.
+static bool RunToolWindow(const std::wstring& args, bool hidden) {
     SIZE_T size = 0;
     InitializeProcThreadAttributeList(nullptr, 1, 0, &size);
     std::vector<char> attrs(size);
@@ -865,7 +898,8 @@ static bool RunToolWindow(const std::wstring& args) {
     STARTUPINFOEXW si{};
     si.StartupInfo.cb = sizeof(si);
     if (haveAttr) si.lpAttributeList = list;
-    std::wstring exe = ToolPath(), cmd = L"\"" + exe + L"\" detach " + args;
+    std::wstring exe = hidden ? Engine_Dir() + L"\\DiaLauncher.exe" : ToolPath();
+    std::wstring cmd = L"\"" + exe + L"\" " + (hidden ? args : L"detach " + args);
     PROCESS_INFORMATION pi{};
     BOOL ok = CreateProcessW(exe.c_str(), cmd.data(), nullptr, nullptr, FALSE,
                              CREATE_NO_WINDOW | (haveAttr ? EXTENDED_STARTUPINFO_PRESENT : 0), nullptr,
@@ -1094,6 +1128,7 @@ static void SyncUpdates() {
 static mux::FrameworkElement BuildPage(NavHook& hook) {
     EnsureCardLook();
     t_toggles.clear();
+    t_restartButtons.clear();
 
     muxc::Grid root;
     root.Padding({24, 44, 24, 24});
@@ -1180,6 +1215,7 @@ static void SyncToggles() {
         }
     if (auto box = t_presetBox.get())
         if (box.SelectedIndex() != PresetIndex()) box.SelectedIndex(PresetIndex());
+    SyncRestartButtons();
     t_syncing = false;
 }
 
@@ -7476,7 +7512,8 @@ static void UpdateHiddenToolbar() {
     UpdateCaptionsForToolbar();
 }
 
-// Dia also lays an invisible window over the toolbar strip (BoostBrowser.WindowCaptionInputSink) that
+// Dia also lays an invisible window over the toolbar strip (BoostBrowser.WindowCaptionInputSink before
+// Dia 1.6, BoostBrowser.NativeCaptionInputWindow since) that
 // turns presses there into window drags. With the toolbar hidden the page sits under it, so its shape is
 // cut down to the sidebar part; Dia's own shape is put back when the toolbar shows.
 struct SinkState {
@@ -7492,7 +7529,8 @@ static HWND FindSink(HWND top) {
     EnumChildWindows(top, [](HWND h, LPARAM lp) -> BOOL {
         wchar_t cls[64];
         GetClassNameW(h, cls, 64);
-        if (wcscmp(cls, L"BoostBrowser.WindowCaptionInputSink") == 0) {
+        if (wcscmp(cls, L"BoostBrowser.WindowCaptionInputSink") == 0 ||
+            wcscmp(cls, L"BoostBrowser.NativeCaptionInputWindow") == 0) {  // (its name since Dia 1.6)
             reinterpret_cast<Ctx*>(lp)->found = h;
             return FALSE;
         }
@@ -8035,6 +8073,7 @@ bool Ui_Tick() {
         stage = "hoverCards";
         UpdateHoverCards();
         UpdateCleanSearchBox();
+        History_Tick();
         UpdateTidyTabs();
         if (tick % 3 == 0) {
             stage = "look";
@@ -8107,6 +8146,15 @@ static mux::FrameworkElement PeekTabList(HWND window) {
         if ((top ? top : TopWindowFor(root)) == window) return list;
     }
     return nullptr;
+}
+
+// Dia's menu labels, compared ignoring case: Dia 1.6 writes "Move to window" and "New window" where 1.5
+// wrote "Move to Window" and "New Window".
+static bool StartsWithNoCase(std::wstring_view s, std::wstring_view prefix) {
+    return s.size() >= prefix.size() && _wcsnicmp(s.data(), prefix.data(), prefix.size()) == 0;
+}
+static bool EndsWithNoCase(std::wstring_view s, std::wstring_view suffix) {
+    return s.size() >= suffix.size() && _wcsnicmp(s.data() + s.size() - suffix.size(), suffix.data(), suffix.size()) == 0;
 }
 
 static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
@@ -8187,7 +8235,7 @@ int Ui_PeekSplitWith(HWND win, const std::wstring& title) {
             if (!child) continue;
             auto item = FirstIn(child, [](const mux::FrameworkElement& fe) {
                 auto mi = fe.try_as<muxc::MenuFlyoutItem>();
-                return mi && std::wstring_view(mi.Text()).starts_with(L"Open as split");
+                return mi && StartsWithNoCase(mi.Text(), L"Open as split");
             });
             if (!item) continue;
             auto mi = item.as<muxc::MenuFlyoutItem>();
@@ -8248,7 +8296,7 @@ int Ui_PeekMoveTab(HWND win, HWND to) {
             if (!child) continue;
             auto element = FirstIn(child, [](const mux::FrameworkElement& fe) {
                 auto sub = fe.try_as<muxc::MenuFlyoutSubItem>();
-                return sub && std::wstring_view(sub.Text()).starts_with(L"Move to Window");
+                return sub && StartsWithNoCase(sub.Text(), L"Move to Window");
             });
             if (!element) continue;
             auto sub = element.as<muxc::MenuFlyoutSubItem>();
@@ -8284,7 +8332,7 @@ int Ui_PeekMoveTab(HWND win, HWND to) {
             std::vector<muxc::MenuFlyoutItem> destinations;
             for (auto const& item : sub.Items()) {
                 auto candidate = item.try_as<muxc::MenuFlyoutItem>();
-                if (candidate && candidate.Text() != L"New Window") destinations.push_back(candidate);
+                if (candidate && _wcsicmp(candidate.Text().c_str(), L"New Window") != 0) destinations.push_back(candidate);
             }
             for (auto const& d : destinations)
                 Log("peek: Move to Window item '%ls'%s", d.Text().c_str(), d.IsEnabled() ? "" : " (disabled)");
@@ -8295,7 +8343,7 @@ int Ui_PeekMoveTab(HWND win, HWND to) {
                 // The source window holds only the preview's tab. When yours holds one tab too, the labels
                 // can't tell them apart: Dia lists the window last active (the preview's) first.
                 auto singleTab = [](const muxc::MenuFlyoutItem& item) {
-                    return std::wstring_view(item.Text()).ends_with(L" & 1 Tab");
+                    return EndsWithNoCase(item.Text(), L" & 1 Tab");
                 };
                 bool firstIsSource = singleTab(destinations[0]), secondIsSource = singleTab(destinations[1]);
                 if (firstIsSource == secondIsSource) firstIsSource = true;

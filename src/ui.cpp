@@ -478,7 +478,15 @@ static mux::FrameworkElement Row(const TweakInfo& t) {
         d.Foreground(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)));
         text.Children().Append(d);
     }
-    if (!t.note.empty()) {  // a caution: warning icon and text in the caution color
+    if (!t.note.empty() && t.key == L"titleBar") {
+        muxc::TextBlock note;
+        note.Text(t.note);
+        note.FontSize(12);
+        note.TextWrapping(mux::TextWrapping::Wrap);
+        note.Foreground(BrushRes(L"TextFillColorSecondaryBrush", Rgba(0xc5, 0xc5, 0xc5)));
+        note.Margin({0, 4, 0, 0});
+        text.Children().Append(note);
+    } else if (!t.note.empty()) {  // a caution: warning icon and text in the caution color
         muxc::Grid n;  // (a grid, so the text wraps)
         n.ColumnSpacing(6);
         n.Margin({0, 4, 0, 0});
@@ -6156,10 +6164,116 @@ struct TitleBarState {
     uint32_t tabsIndex = 0;
     SavedProp tabsRow, toolbarGridRow, topBarMargin;
     mux::Thickness topBarBase{};
+    muxc::StackPanel chrome{nullptr};
+    winrt::weak_ref<muxc::Canvas> chromeFrom;
+    std::vector<std::pair<muxc::Button, uint32_t>> chromeButtons;
+    std::vector<SavedProp> compact;
 };
 static thread_local std::vector<TitleBarState> t_titleBars;
 
+static void RestoreTitleCompact(TitleBarState& st) {
+    for (auto it = st.compact.rbegin(); it != st.compact.rend(); ++it) PutBack(*it);
+    st.compact.clear();
+    if (st.host && st.host.RowDefinitions().Size()) {
+        auto row = st.host.RowDefinitions().GetAt(0);
+        row.Height(mux::GridLengthHelper::Auto());
+        row.MaxHeight(std::numeric_limits<double>::infinity());
+        row.MinHeight(st.barHeight);
+    }
+}
+
+static void TitleSet(TitleBarState& st, const mux::FrameworkElement& fe, const mux::DependencyProperty& dp,
+                     const wf::IInspectable& value) {
+    if (!fe) return;
+    bool known = false;
+    for (auto& saved : st.compact) if (saved.el.get() == fe && saved.dp == dp) { known = true; break; }
+    if (!known) st.compact.push_back(SaveProp(fe, dp));
+    fe.SetValue(dp, value);
+}
+
+static void ReturnTopChrome(TitleBarState& st) {
+    if (st.chrome) {
+        auto from = st.chromeFrom.get();
+        for (auto& [button, index] : st.chromeButtons) {
+            Detach(button, st.chrome);
+            if (from) from.Children().InsertAt((std::min)(index, from.Children().Size()), button);
+        }
+        Detach(st.chrome, st.host);
+    }
+    st.chromeButtons.clear();
+    st.chromeFrom = nullptr;
+    st.chrome = nullptr;
+}
+
+static void PlaceTopChrome(TitleBarState& st, const mux::FrameworkElement& strip) {
+    if (st.chrome && st.chromeFrom.get() && muxm::VisualTreeHelper::GetParent(st.chromeFrom.get()) == strip) return;
+    ReturnTopChrome(st);
+    muxc::Canvas canvas{nullptr};
+    // Dia's first tab-strip canvas contains the native logo and chevron as its only direct buttons.
+    // Its nested canvas holds the tabs; a separate overlay canvas holds the space picker.
+    // Borrow only those two controls, keeping their own handlers, automation names and attached positions.
+    std::vector<std::pair<muxc::Button, uint32_t>> buttons;
+    int count = muxm::VisualTreeHelper::GetChildrenCount(strip);
+    for (int c = 0; c < count; ++c) {
+        auto candidate = muxm::VisualTreeHelper::GetChild(strip, c).try_as<muxc::Canvas>();
+        if (!candidate) continue;
+        buttons.clear();
+        for (uint32_t i = 0; i < candidate.Children().Size(); ++i)
+            if (auto button = candidate.Children().GetAt(i).try_as<muxc::Button>(); button && button.Name().empty())
+                buttons.push_back({button, i});
+        if (buttons.size() == 2) { canvas = candidate; break; }
+    }
+    if (!canvas) return;  // another native layout: leave its controls alone
+    st.chrome = muxc::StackPanel();
+    st.chrome.Name(L"diatweaksTopChrome");
+    st.chrome.Orientation(muxc::Orientation::Horizontal);
+    st.chrome.Spacing(4);
+    st.chrome.HorizontalAlignment(mux::HorizontalAlignment::Left);
+    st.chrome.VerticalAlignment(mux::VerticalAlignment::Center);
+    muxc::Canvas::SetZIndex(st.chrome, 110);
+    st.chromeFrom = winrt::make_weak(canvas);
+    st.chromeButtons = buttons;
+    st.host.Children().Append(st.chrome);
+    for (auto& [button, index] : st.chromeButtons) {
+        Detach(button, canvas);
+        st.chrome.Children().Append(button);
+    }
+}
+
+static void CompactTitleBar(TitleBarState& st, bool topTabs) {
+    auto bar = st.bar.get();
+    if (!topTabs || !bar) { RestoreTitleCompact(st); return; }
+    auto row = st.host.RowDefinitions().GetAt(0);
+    row.MinHeight(32);
+    row.MaxHeight(32);
+    row.Height({32, mux::GridUnitType::Pixel});
+    auto size = [&](const mux::FrameworkElement& fe, double height) {
+        if (!fe) return;
+        TitleSet(st, fe, mux::FrameworkElement::MinHeightProperty(), winrt::box_value(0.0));
+        TitleSet(st, fe, mux::FrameworkElement::HeightProperty(), winrt::box_value(height));
+        TitleSet(st, fe, mux::FrameworkElement::MaxHeightProperty(), winrt::box_value(height));
+    };
+    size(bar, 32);
+    for (auto name : {L"NavigationBarContent", L"diatweaksArcWinStrip", L"AssistantBarHost"}) {
+        auto fe = FindByName(bar, name);
+        if (!fe) continue;
+        size(fe, std::wstring_view(name) == L"NavigationBarContent" ? 32 : 28);
+        auto m = fe.Margin();
+        TitleSet(st, fe, mux::FrameworkElement::MarginProperty(), winrt::box_value(mux::Thickness{m.Left, 0, m.Right, 0}));
+        TitleSet(st, fe, mux::FrameworkElement::VerticalAlignmentProperty(), winrt::box_value(mux::VerticalAlignment::Center));
+    }
+    std::function<void(const mux::DependencyObject&)> buttons = [&](const mux::DependencyObject& parent) {
+        if (auto button = parent.try_as<muxc::Button>()) size(button, 28);
+        int n = muxm::VisualTreeHelper::GetChildrenCount(parent);
+        for (int i = 0; i < n; ++i) buttons(muxm::VisualTreeHelper::GetChild(parent, i));
+    };
+    buttons(bar);
+    for (auto& [button, index] : st.chromeButtons) size(button, 28);
+}
+
 static void ReturnTopTabs(TitleBarState& st) {
+    RestoreTitleCompact(st);
+    ReturnTopChrome(st);
     auto tabs = st.tabs.get();
     if (tabs) {
         Detach(tabs, st.host);
@@ -6220,6 +6334,7 @@ static bool PlaceTopTabs(TitleBarState& st, const mux::XamlRoot& root) {
         st.host.Children().Append(tabs);
         Log("title bar: native top tabs moved below toolbar");
     }
+    PlaceTopChrome(st, strip);
     return true;
 }
 
@@ -6245,9 +6360,13 @@ static void ReserveTitleButtons(TitleBarState& st, const muxc::Grid& main, bool 
                 break;
             }
     auto want = st.topBarBase;
+    if (st.chrome) {
+        st.chrome.Measure({std::numeric_limits<float>::infinity(), 32});
+        want.Left += st.chrome.DesiredSize().Width + 4;
+    }
     want.Right += reserve;
     auto cur = bar.Margin();
-    if (std::abs(cur.Right - want.Right) > 0.5) bar.Margin(want);
+    if (std::abs(cur.Left - want.Left) > 0.5 || std::abs(cur.Right - want.Right) > 0.5) bar.Margin(want);
 }
 
 // lift: how far the toolbar was pulled up (0: not, or nothing up here). Dia's margin goes back at 0.
@@ -6280,6 +6399,7 @@ static void LiftSidebarHeader(TitleBarState& st, const mux::XamlRoot& root, doub
 }
 
 static void ReturnTitleBar(TitleBarState& st) {
+    RestoreTitleCompact(st);
     PutBack(st.topBarMargin);
     st.topBarMargin = {};
     auto bar = st.bar.get();
@@ -6443,6 +6563,7 @@ static void UpdateTitleBar() {
             st.host.Children().Append(active);
         }
         bool topTabs = PlaceTopTabs(st, root);
+        CompactTitleBar(st, topTabs);
         ReserveTitleButtons(st, main, topTabs);
         double lift = AlignTitleBarTop(st, main);
         if (lift >= 0) {
@@ -7530,7 +7651,7 @@ static bool SameRects(const std::vector<winrt::Windows::Graphics::RectInt32>& a,
 // buttons, the space name while it's there and Dia's ⌄.
 static std::vector<winrt::Windows::Graphics::RectInt32> ArcHeaderButtons(const mux::XamlRoot& root) {
     std::vector<winrt::Windows::Graphics::RectInt32> out;
-    if (!ArcSidebarOn() || !root) return out;
+    if (!root) return out;
     double sc = root.RasterizationScale();
     auto take = [&](const mux::FrameworkElement& fe) {
         if (!fe || fe.Visibility() != mux::Visibility::Visible || fe.ActualWidth() <= 0 || fe.ActualHeight() <= 0) return;
@@ -7539,6 +7660,10 @@ static std::vector<winrt::Windows::Graphics::RectInt32> ArcHeaderButtons(const m
         out.push_back({(int)std::floor(at.X * sc), (int)std::floor(at.Y * sc), (int)std::ceil(fe.ActualWidth() * sc),
                        (int)std::ceil(fe.ActualHeight() * sc)});
     };
+    for (auto& st : t_titleBars)
+        if (st.chrome && st.chrome.XamlRoot() == root)
+            for (auto& [button, index] : st.chromeButtons) take(button);
+    if (!ArcSidebarOn()) return out;
     for (auto& [h, st] : t_arc) {
         auto header = st.header.get();
         if (!header || header.XamlRoot() != root || !ShownOnScreen(header)) continue;

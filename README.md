@@ -39,6 +39,8 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Hide tab search button ✨ | Hides the ⌄ button at the top of the sidebar |
 | Hide Chat button | Hides the Chat button |
 | Hide page loading animation ✨ | Hides the orange bar that sweeps across the address field while a page loads |
+| **New Tab** | |
+| Clean search box | Turns the New Tab box and the Ctrl+L / Ctrl+T bar into one search line: no "Add tabs or files" row, the send button sits at the end of the line |
 | **Sidebar & tab bar** | |
 | Hide pinned tab border | Removes the colored border around the selected pinned tab |
 | Hide tab hover card ✨ | Stops the card with the page title, site and buttons from popping up when you hover a tab or pinned tab |

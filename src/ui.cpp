@@ -3764,6 +3764,209 @@ static void ScheduleHoverCards() {
     });
 }
 
+// ---------------------------------------------------------------- Clean search box
+// Dia's command box (New Tab page, Ctrl+L, Ctrl+T) has a second row under the text: "Add tabs or files"
+// on the left, send (↑ / "Go ↵" / "Google ↵") on the right. With this patch that row goes: everything in
+// it but the send button is collapsed, and the row's grid (ToolbarArea) moves up to the right end of the
+// text row. The box becomes a single search line. Only the New Tab page's box (under VariantHost) and
+// the command bar popover (under DynamicPopoverRoot) are touched, never chat. Off puts every value back.
+
+struct CleanBoxState {
+    winrt::weak_ref<muxc::Grid> area;     // ToolbarArea
+    winrt::weak_ref<muxc::Grid> content;  // CommandBarContentGrid (its parent)
+    winrt::weak_ref<muxc::Border> card;   // CommandBarCard (the box)
+    mux::Thickness cardPadding{};
+    winrt::weak_ref<mux::FrameworkElement> input;  // InputContent (the text row)
+    mux::Thickness inputMargin{};
+    winrt::event_token sizeToken{};
+    double lineCenter = 0;  // middle of the first line of text, from the top of the text row
+    double bottomPad = 0;   // card bottom padding that centers that line in the box
+    bool measured = false;
+    int row = 0;
+    mux::HorizontalAlignment halign{};
+    mux::VerticalAlignment valign{};
+    mux::Thickness margin{};
+    mux::GridLength rowHeight{};
+    double minHeight = 0;  // the content grid's (Dia: 96, two rows)
+    std::vector<std::pair<winrt::weak_ref<mux::UIElement>, mux::Visibility>> hidden;
+};
+static thread_local std::vector<CleanBoxState> t_cleanBoxes;
+static thread_local bool t_cleanPending = false;
+static thread_local winrt::event_token t_cleanToken{};
+
+static void RestoreCleanBox(CleanBoxState& st) {
+    for (auto& [w, v] : st.hidden)
+        if (auto e = w.get()) e.Visibility(v);
+    auto a = st.area.get();
+    auto c = st.content.get();
+    if (a) {
+        muxc::Grid::SetRow(a, st.row);
+        a.HorizontalAlignment(st.halign);
+        a.VerticalAlignment(st.valign);
+        a.Margin(st.margin);
+    }
+    if (c) c.MinHeight(st.minHeight);
+    if (auto b = st.card.get()) b.Padding(st.cardPadding);
+    if (auto i = st.input.get()) i.Margin(st.inputMargin);
+    if (a && st.sizeToken) a.SizeChanged(st.sizeToken);
+    if (c && st.row >= 0 && (uint32_t)st.row < c.RowDefinitions().Size())
+        c.RowDefinitions().GetAt(st.row).Height(st.rowHeight);
+}
+
+// The New Tab page's box or the Ctrl+L / Ctrl+T command bar; not chat.
+static bool CleanBoxScope(const mux::DependencyObject& el) {
+    mux::DependencyObject p = el;
+    for (int i = 0; p && i < 40; i++, p = muxm::VisualTreeHelper::GetParent(p))
+        if (auto fe = p.try_as<mux::FrameworkElement>()) {
+            auto n = fe.Name();
+            if (n == L"AssistantPanelHost") return false;
+            if (n == L"VariantHost" || n == L"DynamicPopoverRoot") return true;
+        }
+    return false;
+}
+
+// Middle of the text's first line, from the top of the text row: the icon left of the text is centered on it.
+static double LineCenterInRow(const mux::FrameworkElement& input) {
+    for (auto name : {L"QueryIcon", L"QueryIconImage", L"QueryChatIconHost"}) {
+        auto e = FindByName(input, name);
+        if (!e || e.Visibility() != mux::Visibility::Visible || e.ActualHeight() <= 0) continue;
+        return e.TransformToVisual(input).TransformPoint({0, (float)(e.ActualHeight() / 2)}).Y;
+    }
+    return 0;
+}
+
+// Room Dia leaves free at the right end of the text row (New Tab: 32 px; Ctrl+L: none while its x shows).
+static double FreeRightInRow(const mux::FrameworkElement& input) {
+    double used = 0;
+    for (auto name : {L"QueryTextBoxHost", L"QueryClearButton"}) {
+        auto e = FindByName(input, name);
+        if (!e || e.Visibility() != mux::Visibility::Visible || e.ActualWidth() <= 0) continue;
+        double right = e.TransformToVisual(input).TransformPoint({(float)e.ActualWidth(), 0}).X;
+        used = (std::max)(used, right);
+    }
+    return used > 0 ? (std::max)(0.0, input.ActualWidth() - used) : 0;
+}
+
+static void ScheduleCleanSearchBox();
+static void UpdateCleanSearchBox() {
+    if (!Engine_TweakOn(L"cleanSearchBox")) {
+        if (!t_cleanBoxes.empty()) {
+            for (auto& st : t_cleanBoxes) RestoreCleanBox(st);
+            t_cleanBoxes.clear();
+            Log("clean search box: off");
+        }
+        return;
+    }
+    for (auto h : FindNodes(L"ToolbarArea")) {
+        auto area = Obj<muxc::Grid>(h);
+        if (!area) continue;
+        auto content = muxm::VisualTreeHelper::GetParent(area).try_as<muxc::Grid>();
+        if (!content || content.Name() != L"CommandBarContentGrid" || !CleanBoxScope(content)) continue;
+        if (!FindByName(area, L"SubmitButton")) continue;
+        CleanBoxState* st = nullptr;
+        for (auto& x : t_cleanBoxes)
+            if (x.area.get() == area) st = &x;
+        if (!st) {
+            int row = muxc::Grid::GetRow(area);
+            if (row <= 0 || (uint32_t)row >= content.RowDefinitions().Size()) continue;  // not Dia's usual layout
+            CleanBoxState n;
+            n.area = winrt::make_weak(area);
+            n.content = winrt::make_weak(content);
+            n.row = row;
+            n.halign = area.HorizontalAlignment();
+            n.valign = area.VerticalAlignment();
+            n.margin = area.Margin();
+            n.minHeight = content.MinHeight();
+            if (auto card = muxm::VisualTreeHelper::GetParent(content).try_as<muxc::Border>();
+                card && card.Name() == L"CommandBarCard")
+                n.card = winrt::make_weak(card), n.cardPadding = card.Padding();
+            n.rowHeight = content.RowDefinitions().GetAt(row).Height();
+            t_cleanBoxes.push_back(std::move(n));
+            st = &t_cleanBoxes.back();
+            static int logged = 0;
+            if (logged++ < 5) Log("clean search box: on (row %d)", row);
+        }
+        // Everything in the row but send (Dia can show more there later, e.g. while a chat runs).
+        for (auto const& c : area.Children()) {
+            auto fe = c.try_as<mux::FrameworkElement>();
+            if (fe && fe.Name() == L"SubmitButton") continue;
+            if (c.Visibility() == mux::Visibility::Collapsed) continue;
+            bool known = false;
+            for (auto& [w, v] : st->hidden)
+                if (w.get() == c) known = true;
+            if (!known) st->hidden.push_back({winrt::make_weak(c), c.Visibility()});
+            c.Visibility(mux::Visibility::Collapsed);
+        }
+        // Into the text's row (InputContent; row 1 on Dia 1.5).
+        int textRow = 1;
+        for (auto const& c : content.Children())
+            if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"InputContent")
+                textRow = muxc::Grid::GetRow(fe);
+        if (textRow == st->row) continue;
+        // The button sits at the right end of the text row. Dia leaves some room there (32 px on the New
+        // Tab page; on Ctrl+L its x takes it), but the button is wider while you type ("Go ↵",
+        // "Google ↵", "Chat"), so the text row is pushed in by the rest: the text never runs under it.
+        if (!st->input.get()) {
+            for (auto const& c : content.Children())
+                if (auto fe = c.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"InputContent")
+                    st->input = winrt::make_weak(fe), st->inputMargin = fe.Margin();
+            st->sizeToken = area.SizeChanged([](auto&&, auto&&) { ScheduleCleanSearchBox(); });
+        }
+        // The button is centered on the first line of text, and the card's bottom padding is set so that
+        // line sits in the middle of the box (New Tab's row is 48 px with the text near its top, so it
+        // loses its padding; Ctrl+L's 32 px row keeps it). Measured on every pass: Ctrl+L and Ctrl+T can
+        // share one box laid out differently.
+        if (auto in = st->input.get(); in && in.ActualHeight() > 0 && area.ActualHeight() > 0) {
+            if (double c = LineCenterInRow(in); c > 0) {
+                st->lineCenter = c;
+                st->bottomPad = (std::clamp)(st->cardPadding.Top + 2 * c - in.ActualHeight(), 0.0, st->cardPadding.Bottom);
+                st->measured = true;
+            }
+        }
+        if (auto in = st->input.get()) {
+            double extra = (std::max)(0.0, area.ActualWidth() - FreeRightInRow(in));
+            auto m = in.Margin();
+            if (std::abs(m.Right - (st->inputMargin.Right + extra)) > 0.5)
+                in.Margin({m.Left, m.Top, st->inputMargin.Right + extra, m.Bottom});
+        }
+        if (muxc::Grid::GetRow(area) != textRow) muxc::Grid::SetRow(area, textRow);
+        if (area.HorizontalAlignment() != mux::HorizontalAlignment::Right)
+            area.HorizontalAlignment(mux::HorizontalAlignment::Right);
+        if (area.VerticalAlignment() != mux::VerticalAlignment::Top)
+            area.VerticalAlignment(mux::VerticalAlignment::Top);
+        // Can be negative: on Ctrl+L / Ctrl+T the line's middle is 12 px into a 32 px row, so the 32 px
+        // button rises 4 px into the card's top padding to stay level with the text.
+        double top = st->measured ? (std::max)(-st->cardPadding.Top, st->lineCenter - area.ActualHeight() / 2) : 0;
+        if (auto m = area.Margin(); std::abs(m.Top - top) > 0.5 || m.Bottom != 0) area.Margin({m.Left, top, m.Right, 0});
+        if (content.MinHeight() != 0) content.MinHeight(0);
+        if (auto card = st->card.get()) {
+            double bottom = st->measured ? st->bottomPad : st->cardPadding.Bottom;
+            if (auto pd = card.Padding(); std::abs(pd.Bottom - bottom) > 0.5)
+                card.Padding({pd.Left, pd.Top, pd.Right, bottom});
+        }
+        auto rd = content.RowDefinitions().GetAt(st->row);
+        if (rd.Height().Value != 0 || rd.Height().GridUnitType != mux::GridUnitType::Pixel)
+            rd.Height(mux::GridLength{0, mux::GridUnitType::Pixel});
+    }
+    t_cleanBoxes.erase(std::remove_if(t_cleanBoxes.begin(), t_cleanBoxes.end(),
+                                      [](const CleanBoxState& x) { return !x.area.get(); }),
+                       t_cleanBoxes.end());
+}
+
+// Runs before the next frame, so a new New Tab page never shows the old two-row box.
+static void ScheduleCleanSearchBox() {
+    if (t_cleanPending || !Engine_TweakOn(L"cleanSearchBox")) return;
+    t_cleanPending = true;
+    t_cleanToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        muxm::CompositionTarget::Rendering(t_cleanToken);
+        t_cleanPending = false;
+        try {
+            UpdateCleanSearchBox();
+        } catch (...) {
+        }
+    });
+}
+
 // ---------------------------------------------------------------- Arc URL bar
 static double NowMs();
 // Arc-style sidebar: Dia's own sidebar toggle, back/forward/reload buttons and its real address
@@ -4949,6 +5152,7 @@ void Ui_ElementAdded(const std::wstring& name) {
         ScheduleArcAdopt();
     }
     if (name == L"ActionsRow") ScheduleHoverCards();
+    if (name == L"ToolbarArea" || name == L"SubmitButton") ScheduleCleanSearchBox();
     if (name == L"PopoverLayoutRoot" || name == L"CommandBarContainerRoot") ScheduleAnchor();
     if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton" ||
         name == L"VariantHost")
@@ -7588,6 +7792,7 @@ bool Ui_Tick() {
         Peek_Tick();
         stage = "hoverCards";
         UpdateHoverCards();
+        UpdateCleanSearchBox();
         UpdateTidyTabs();
         if (tick % 3 == 0) {
             stage = "look";

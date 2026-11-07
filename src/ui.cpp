@@ -6532,6 +6532,7 @@ bool Ui_Tick() {
         stage = "hoverCards";
         UpdateHoverCards();
         UpdateCleanSearchBox();
+        History_Tick();
         UpdateTidyTabs();
         if (tick % 3 == 0) {
             stage = "look";

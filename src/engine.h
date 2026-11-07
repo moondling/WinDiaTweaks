@@ -78,6 +78,10 @@ bool Ui_PeekShowTabMenu(HWND window);
 void Ui_PeekCloseTabMenu(HWND window);
 void Peek_BeforeMove();  // (peek.cpp: just before the tab moves)
 
+// ---- provided by history.cpp (Hide history suggestions)
+// Runs every timer tick on each UI thread.
+void History_Tick();
+
 // ---- provided by peek.cpp (the Peek tweak: hold on a link to preview it)
 // Runs every timer tick on each UI thread.
 void Peek_Tick();

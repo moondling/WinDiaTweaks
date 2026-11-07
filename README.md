@@ -18,7 +18,7 @@ At the top of **Patches**, **Preset** sets everything at once:
 
 - **None**: Dia as it comes (the default).
 - **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic.
-- **Arc (Windows)**: like Arc for Windows. The toolbar stays, in the sidebar's color, with just the site centered in it; otherwise the same as Arc.
+- **Arc (Windows)**: like Arc for Windows. The toolbar stays, up in the title bar in the sidebar's color, with just the site centered in it; otherwise the same as Arc.
 - **Custom**: your own mix. Changing any tweak switches to it.
 
 | Tweak | Does |
@@ -27,11 +27,11 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Edge-to-edge web content | Removes the gap between pages and the window edge |
 | Square corners by the sidebar | Pages meet the sidebar and window edges with straight corners |
 | **Toolbar** | |
-| Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window |
+| Hide toolbar (reveal on hover) | Hides the toolbar; it slides back in while the pointer is at the top of the window, and stays a moment after the pointer leaves. In a window, the top edge lets the pointer through to the toolbar instead of resizing, until it has rested there 1.5 s |
 | Show toolbar with the sidebar | With the toolbar hidden, shows it while the sidebar is open |
 | Show toolbar on new tab pages | With the toolbar hidden, keeps it on new tab pages |
-| Toolbar in the title bar ✨ | Moves the toolbar into the window's top row, level with the window buttons, in the sidebar's colors (its color or window material). The page and side panels start below it, so it stays put when a side panel opens. Split view keeps a toolbar in each pane, as Dia has it. Off: Dia's own toolbar in the site's color |
-| Address bar ✨ | **Toolbar (Dia)**: Dia's own toolbar. **Sidebar (Arc for Mac)**: moves the sidebar button, back, forward, reload and the address into the top of the sidebar; the address shows just the site, its buttons appear on hover. **Centered (Arc for Windows)**: one fixed toolbar in the sidebar's color with just the site centered between its ☆ and ⋯ buttons, no loading bar, the sidebar button right after the Dia logo; clicking the site opens the command bar in the middle of the window, and the toolbar's empty space drags the window |
+| Toolbar in the title bar ✨ | Moves the toolbar into the window's top row, level with the window buttons, in the sidebar's colors (its color or window material). The page and side panels start below it, so it stays put when a side panel opens. Split view keeps a toolbar in each pane, as Dia has it. Off: Dia's own toolbar in the site's color. With the Centered address bar the centered toolbar moves up too. With Hide toolbar or the Sidebar address bar, the toolbar that slides down sits level with the window buttons too (the gap above the page closes while it's out), the sidebar's top row stays level with it, and the Chat button shows its box only on hover |
+| Address bar ✨ | **Toolbar (Dia)**: Dia's own toolbar. **Sidebar (Arc for Mac)**: turns Hide toolbar on (the other two turn it off) and moves the sidebar button, back, forward, reload and the address into the top of the sidebar; the address shows just the site, its buttons appear on hover, and the space name moves up into the toolbar that slides down. **Centered (Arc for Windows)**: one fixed toolbar, in Dia's colors (the sidebar's with Toolbar in the title bar), with just the site centered between its ☆ and ⋯ buttons, no loading bar, the sidebar button right after the Dia logo; clicking the site opens the command bar in the middle of the window, and the toolbar's empty space drags the window |
 | Floating new tab bar ✨ | Ctrl+T shows the address bar floating over the page instead of a New Tab page; Enter opens the result in a new tab |
 | **Toolbar items** | |
 | Always show address field | Keeps the address field's background and buttons visible, not just on hover |

@@ -31,6 +31,7 @@ void Engine_SetMany(const std::vector<std::pair<std::wstring, bool>>& states,
                     const std::vector<std::pair<std::wstring, std::wstring>>& values);
 bool Engine_SafeMode();
 bool Engine_Hover();  // pointer at the top edge (reveal toolbar on hover)
+ULONGLONG Engine_PointerAtTopMs();  // how long the pointer has been at the top edge (0 = not there)
 void Engine_LeaveSafeMode();
 // Live elements on the calling UI thread.
 struct NodeRef {
@@ -54,6 +55,11 @@ bool Ui_State(const std::wstring& name);
 void Ui_StateApplied();
 // Start watching a property the engine overrides, to catch Dia changing it back.
 void Ui_WatchProperty(InstanceHandle h, const std::wstring& prop);
+// Dia's data binding on a property a rule is about to override: kept, put back when the rule lets go
+// (false: none, or the property isn't known), or forgotten once Dia sets a plain value there instead.
+bool Ui_SaveBinding(InstanceHandle h, const std::wstring& prop);
+bool Ui_RestoreBinding(InstanceHandle h, const std::wstring& prop);
+void Ui_ForgetBinding(InstanceHandle h, const std::wstring& prop);
 // A named element just entered Dia's UI tree (called from the tree-change notification).
 void Ui_ElementAdded(const std::wstring& name);
 // Opens a real new tab and goes to the text there (an address or a search), as the Ctrl+T bar does.

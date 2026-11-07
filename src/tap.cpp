@@ -302,6 +302,8 @@ struct Applied {
     std::wstring origType, origText;
     InstanceHandle origHandle = 0;  // fallback for values WinUI can't print (e.g. CornerRadius)
     std::wstring ourText;           // the value the tweak sets, as written in tweaks.conf
+    std::wstring propName;
+    bool binding = false;           // Dia's value was a binding, kept in ui.cpp (Ui_SaveBinding)
 };
 // True while the engine itself changes a property, so the change watchers in ui.cpp ignore it.
 static bool g_selfChange = false;
@@ -411,7 +413,11 @@ static void ApplySetter(InstanceHandle h, const Setter& s) {
     auto ex = perElem.find(idx);
     if (ex == perElem.end()) {
         Applied a{idx, val, hasLocal, localType, localText};
+        a.propName = s.prop;
         if (hasLocal) g_vts->GetProperty(h, idx, &a.origHandle);
+        // Dia sets some values through a data binding (the address text's IsHitTestVisible): our value would
+        // replace the binding for good, so it's kept to be put back as a binding.
+        if (hasLocal && localType.find(L"Binding") != std::wstring::npos) a.binding = Ui_SaveBinding(h, s.prop);
         perElem[idx] = a;
     }
     else ex->second.value = val;
@@ -434,11 +440,15 @@ static void ApplySetter(InstanceHandle h, const Setter& s) {
 // Enum values are reported as numbers but created from names.
 static std::wstring EnumText(const std::wstring& type, const std::wstring& text) {
     if (type.find(L"Visibility") != std::wstring::npos) return text == L"1" ? L"Collapsed" : text == L"0" ? L"Visible" : text;
+    // Booleans too: "1" was read back as False, which left the address text unclickable.
+    if (type.find(L"Boolean") != std::wstring::npos) return text == L"1" ? L"True" : text == L"0" ? L"False" : text;
     return text;
 }
 
 static void UndoOne(InstanceHandle h, unsigned idx, const Applied& a) {
     SelfChange guard;
+    // A binding goes back as a binding: it then shows Dia's current value and keeps following it.
+    if (a.binding && Ui_RestoreBinding(h, a.propName)) return;
     if (a.hadLocal && !a.origType.empty() && !a.origText.empty() &&
         a.origType.find(L"Binding") == std::wstring::npos) {
         InstanceHandle v = MakeValue(a.origType, EnumText(a.origType, a.origText));
@@ -541,6 +551,7 @@ void Engine_OnDiaChanged(InstanceHandle h, const std::wstring& prop, const std::
             if (t != g_valueType.end()) a->second.origType = t->second;
         }
         a->second.origHandle = 0;
+        if (a->second.binding) Ui_ForgetBinding(h, prop), a->second.binding = false;  // Dia's plain value now
     }
     SelfChange guard;
     g_vts->SetProperty(h, a->second.value, idx);
@@ -636,40 +647,87 @@ static std::atomic<HWND> g_pingWnd{nullptr};
 static const UINT WM_DT_HOVER = WM_APP + 0x3a1;
 
 // True while the pointer sits at the top edge of a Dia window owned by `uiThread`. Once shown, it
-// stays true until the pointer moves below the toolbar, so the toolbar can be used.
+// stays true until the pointer moves below the toolbar, so the toolbar can be used, or overshoots the
+// window's top by more than a little (in a window, the pointer can go past the edge onto what's above).
+static HWND g_topRoot = nullptr;  // the window the pointer was last at the top of (watcher thread only)
+
 static bool PointerAtTop(DWORD uiThread, bool shown) {
     POINT pt;
     if (!GetCursorPos(&pt)) return false;
-    HWND w = WindowFromPoint(pt);
-    if (!w) return false;
-    HWND root = GetAncestor(w, GA_ROOT);
-    DWORD pid = 0;
-    DWORD tid = GetWindowThreadProcessId(root, &pid);
-    if (pid != GetCurrentProcessId() || tid != uiThread) return false;
+    HWND root = nullptr;
+    if (HWND w = WindowFromPoint(pt)) {
+        root = GetAncestor(w, GA_ROOT);
+        DWORD pid = 0;
+        DWORD tid = GetWindowThreadProcessId(root, &pid);
+        if (pid != GetCurrentProcessId() || tid != uiThread) root = nullptr;
+    }
+    bool past = false;  // over something else, just above the window the toolbar is out in
+    if (!root) {
+        if (!shown || !g_topRoot || !IsWindow(g_topRoot)) return false;
+        root = g_topRoot, past = true;
+    }
     POINT origin{0, 0};
     ClientToScreen(root, &origin);
     UINT dpi = GetDpiForWindow(root);
     if (!dpi) dpi = 96;
     int y = pt.y - origin.y;
-    int showBand = MulDiv(6, dpi, 96), keepBand = MulDiv(52, dpi, 96);
+    if (past) {
+        RECT rc;
+        GetClientRect(root, &rc);
+        int x = pt.x - origin.x;
+        return x >= 0 && x < rc.right && y < 0 && y >= -MulDiv(24, dpi, 96);
+    }
+    g_topRoot = root;
+    // Maximized or full screen, the pointer stops at the screen's edge: a thin band is enough and leaves the
+    // page's top alone. In a window, the top few pixels are Windows' resize border (the pointer turns into
+    // the resize arrow there), so the band reaches below it.
+    bool fills = IsZoomed(root);
+    if (!fills) {
+        MONITORINFO mi{sizeof(mi)};
+        RECT r;
+        if (GetWindowRect(root, &r) && GetMonitorInfoW(MonitorFromWindow(root, MONITOR_DEFAULTTONEAREST), &mi))
+            fills = r.top <= mi.rcMonitor.top && r.left <= mi.rcMonitor.left && r.right >= mi.rcMonitor.right;
+    }
+    int showBand = MulDiv(fills ? 6 : 12, dpi, 96), keepBand = MulDiv(52, dpi, 96);
     return y >= 0 && y < (shown ? keepBand : showBand);
 }
 
+static std::atomic<ULONGLONG> g_topSince{0};  // GetTickCount64 when the pointer reached the top edge, 0 = not there
+
+// Leaving takes this long of the pointer staying away: a quick pass over the edge doesn't hide it.
+static constexpr ULONGLONG kTopLeaveMs = 200;
+
 static DWORD WINAPI HoverWatcher(LPVOID) {
     bool last = false;
+    ULONGLONG awaySince = 0;  // the pointer left while shown, at this tick (0 = it hasn't)
     for (;;) {
         if (!g_watchHover || !g_pingWnd) {
             if (last) last = false, PostMessageW(g_pingWnd, WM_DT_HOVER, 0, 0);
+            g_topSince = 0, awaySince = 0;
             Sleep(60);
             continue;
         }
         bool now = PointerAtTop(g_hoverThread, last);
+        if (last && !now) {
+            ULONGLONG t = GetTickCount64();
+            if (!awaySince) awaySince = t;
+            if (t - awaySince < kTopLeaveMs) now = true;  // not yet
+        } else {
+            awaySince = 0;  // there (or came back in time)
+        }
         if (now != last) {
             last = now;
+            awaySince = 0;
+            g_topSince = now ? GetTickCount64() : 0;
             PostMessageW(g_pingWnd, WM_DT_HOVER, now, 0);
         }
         Sleep(8);
     }
+}
+
+ULONGLONG Engine_PointerAtTopMs() {
+    ULONGLONG since = g_topSince;
+    return since ? GetTickCount64() - since : 0;
 }
 
 static void EvaluateThread() {
@@ -679,14 +737,17 @@ static void EvaluateThread() {
 
 // Re-evaluates only the elements that rules with a state= condition can apply to (by name), so a
 // state change touches a couple of elements instead of the whole tree.
-static void EvaluateStateNodes() {
+// hoverOnly: just the rules whose state follows the pointer (hover, showToolbar); a hover change
+// touches nothing else.
+static void EvaluateStateNodes(bool hoverOnly = false) {
     std::vector<std::wstring> names;
     bool anyUnnamed = false;
     for (auto& r : g_rules) {
         bool usesState = false;
         const Cond* nameCond = nullptr;
         for (auto& c : r.conds) {
-            if (c.field == L"state") usesState = true;
+            if (c.field == L"state" && (!hoverOnly || c.value == L"hover" || c.value == L"showToolbar"))
+                usesState = true;
             if (c.field == L"name" && !c.negate && !c.contains) nameCond = &c;
         }
         if (!usesState) continue;
@@ -708,7 +769,7 @@ static LRESULT CALLBACK PingProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
             LARGE_INTEGER f, a, b;
             QueryPerformanceFrequency(&f);
             QueryPerformanceCounter(&a);
-            EvaluateStateNodes();
+            EvaluateStateNodes(true);
             Ui_StateApplied();
             QueryPerformanceCounter(&b);
             static int logged = 0;
@@ -733,6 +794,12 @@ static VOID CALLBACK TimerProc(HWND, UINT, UINT_PTR, DWORD) {
         seenReload = reloadGen;
         reevaluate = true;
     }
+    // Tweaks just went on or off: their rules first, so the code in Ui_Tick finds Dia's own values. (The
+    // Arc URL bar saves what it finds on the elements it borrows: switching to it from Toolbar in the title
+    // bar, it saved that patch's IsHitTestVisible=False on the address text as Dia's and put it back on the
+    // way out, so the address could no longer be clicked or hovered.) Then again after, for rules that
+    // depend on where Ui_Tick has just moved things.
+    if (reevaluate) EvaluateThread();
     bool stateChanged = Ui_Tick();
     g_watchHover = RulesUseState() || TweakOn(L"hideToolbar");
     if (reevaluate) EvaluateThread();

@@ -30,6 +30,11 @@ set FLAGS=/nologo /utf-8 /std:c++20 /O2 /EHsc /W3 /DUNICODE /D_UNICODE /D_CRT_SE
 rem C++/WinRT headers for Dia's WinUI live in gen\ (made from Dia's own .winmd files by gen-winrt.cmd).
 if not exist gen\winrt\Microsoft.UI.Xaml.Controls.h call "%~dp0gen-winrt.cmd" || exit /b 1
 for /f "delims=" %%v in ('dir /b /ad /o-n "%ProgramFiles(x86)%\Windows Kits\10\Include\10.*" 2^>nul') do if not defined SDKV set "SDKV=%%v"
+rem Keep a running Dia's loaded image under .old so the build can write an unlocked copy.
+for %%f in (diatweaks.exe DiaLauncher.exe DiaTweaksTap.dll) do if exist bin\%%f (
+    if exist bin\%%f.old del bin\%%f.old 2>nul
+    ren bin\%%f %%f.old 2>nul && copy /y bin\%%f.old bin\%%f >nul
+)
 cl %FLAGS% /bigobj /Zi /I gen /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" /LD src\tap.cpp src\ui.cpp src\peek.cpp src\history.cpp /Fobin\ /Febin\DiaTweaksTap.dll /link /DEBUG /OPT:REF /DEF:src\tap.def ole32.lib oleaut32.lib user32.lib gdi32.lib shell32.lib windowsapp.lib dwmapi.lib comctl32.lib msimg32.lib d3d11.lib dcomp.lib d2d1.lib || exit /b 1
 cl %FLAGS% /I bin /I "%ProgramFiles(x86)%\Windows Kits\10\Include\%SDKV%\cppwinrt" src\diatweaks.cpp /Fobin\ /Febin\diatweaks.exe /link ole32.lib user32.lib shell32.lib windowsapp.lib || exit /b 1
 rem DiaLauncher.exe: the same program without a console window, for the "Dia (Tweaks)" shortcut.

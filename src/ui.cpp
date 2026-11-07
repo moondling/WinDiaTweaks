@@ -1307,8 +1307,8 @@ static bool ComputeNewTab() {
 // toolbar and the Arc URL bar in the sidebar lay the toolbar out themselves and take priority over it;
 // Centered (Arc for Windows) keeps its strip, which goes up with the toolbar. Split view keeps Dia's layout
 // (a toolbar in each pane). The colors stay in all of these.
-static bool TitleBarMoveWanted(bool topTabs, bool split) {
-    return Engine_TweakOn(L"titleBar") && !topTabs && !split && !Engine_TweakOn(L"hideToolbar") &&
+static bool TitleBarMoveWanted(bool split) {
+    return Engine_TweakOn(L"titleBar") && !split && !Engine_TweakOn(L"hideToolbar") &&
            !(Engine_TweakOn(L"arcUrlBar") && Engine_TweakValue(L"arcUrlBar") != L"windows");
 }
 
@@ -1325,14 +1325,13 @@ static bool UpdateStates() {
         now[L"split"] = split;
     }
     // Dia's tab layout set to the top bar (Settings > Tabs): the tab strip (TabStripContentHost) sits in
-    // the window's top row, the one Toolbar in the title bar moves the toolbar into. That patch is for the
-    // sidebar layout and stands aside while this holds (TitleBarOn, and state!=topTabs in its rules).
+    // the window's top row. Toolbar in the title bar moves that native strip below its toolbar.
     now[L"topTabs"] = false;
     for (auto h : FindNodes(L"TabStripContentHost"))
         if (auto fe = Obj<mux::FrameworkElement>(h); fe && ShownOnScreen(fe)) now[L"topTabs"] = true;
     if (now[L"topTabs"] != Ui_State(L"topTabs")) Log("tab layout: %s", now[L"topTabs"] ? "top bar" : "sidebar");
     // The toolbar is up in the title bar: its rules (tweaks.conf) hold only then.
-    now[L"titleBarUp"] = TitleBarMoveWanted(now[L"topTabs"], now[L"split"]);
+    now[L"titleBarUp"] = TitleBarMoveWanted(now[L"split"]);
     bool changed = now != t_states;
     t_states = now;
     return changed;
@@ -1447,11 +1446,9 @@ static thread_local winrt::event_token t_lookToken{};
 
 // Toolbar in the title bar: the toolbar comes in the sidebar's colors (with Dia's site colors up there it
 // clashed, and the page's rounded top corners come with these). Off: Dia's own, adaptive colors.
-// Only with Dia's sidebar tab layout: with tabs in the top bar the toolbar would cover them (topTabs in
-// UpdateStates), so the whole patch stands aside, colors too.
-static bool TitleBarOn() { return Engine_TweakOn(L"titleBar") && !Ui_State(L"topTabs"); }
+static bool TitleBarOn() { return Engine_TweakOn(L"titleBar"); }
 // The move itself (see TitleBarMoveWanted).
-static bool TitleBarMoveOn() { return TitleBarMoveWanted(Ui_State(L"topTabs"), Ui_State(L"split")); }
+static bool TitleBarMoveOn() { return TitleBarMoveWanted(Ui_State(L"split")); }
 // The sidebar's colors come with Toolbar in the title bar only: Centered (Arc for Windows) keeps Dia's
 // toolbar colors, following the site, unless that's on too.
 static bool ToolbarSidebar() { return TitleBarOn(); }
@@ -5157,7 +5154,8 @@ void Ui_ElementAdded(const std::wstring& name) {
     if (name == L"NavigationBarContent" || name == L"NavigationBarHost" || name == L"MinimizeButton" ||
         name == L"VariantHost")
         ScheduleToolbarLook();
-    if (name == L"NavigationBarHost" || name == L"VariantHost" || name == L"ContentGroup") ScheduleTitleBar();
+    if (name == L"NavigationBarHost" || name == L"VariantHost" || name == L"ContentGroup" ||
+        name == L"TabStripContentHost" || name == L"SpacePagingScrollViewer") ScheduleTitleBar();
 }
 
 static void UpdateArcBar() {
@@ -6152,8 +6150,105 @@ struct TitleBarState {
     winrt::weak_ref<mux::FrameworkElement> header;
     mux::Thickness headerDia{}, headerOurs{};  // its margin as Dia had it, and as we set it
     bool headerLifted = false;
+    // Top tabs: borrow the whole native paging scroller (tabs, spaces and Tidy), not individual tabs.
+    winrt::weak_ref<muxc::ScrollViewer> tabs;
+    winrt::weak_ref<muxc::Panel> tabsFrom;
+    uint32_t tabsIndex = 0;
+    SavedProp tabsRow, toolbarGridRow, topBarMargin;
+    mux::Thickness topBarBase{};
 };
 static thread_local std::vector<TitleBarState> t_titleBars;
+
+static void ReturnTopTabs(TitleBarState& st) {
+    auto tabs = st.tabs.get();
+    if (tabs) {
+        Detach(tabs, st.host);
+        PutBack(st.tabsRow);
+        if (auto from = st.tabsFrom.get())
+            from.Children().InsertAt((std::min)(st.tabsIndex, from.Children().Size()), tabs);
+    }
+    st.tabs = nullptr;
+    st.tabsFrom = nullptr;
+    st.tabsRow = {};
+    if (st.host && st.host.RowDefinitions().Size() > 1) st.host.RowDefinitions().GetAt(1).MinHeight(0);
+    PutBack(st.topBarMargin);
+    st.topBarMargin = {};
+}
+
+// The strip is in a separate overlay beside the page grid. Moving its paging scroller into row 1 of
+// our host makes that grid reserve both rows, while closing the old pane-toolbar row keeps the page at
+// the same height. The scroller's controls and data bindings stay intact.
+static bool PlaceTopTabs(TitleBarState& st, const mux::XamlRoot& root) {
+    mux::FrameworkElement strip{nullptr};
+    for (auto h : FindNodes(L"TabStripContentHost")) {
+        auto fe = Obj<mux::FrameworkElement>(h);
+        if (fe && fe.XamlRoot() == root && ShownOnScreen(fe)) { strip = fe; break; }
+    }
+    muxc::ScrollViewer tabs{nullptr};
+    for (mux::DependencyObject p = strip; p; p = muxm::VisualTreeHelper::GetParent(p))
+        if (auto sv = p.try_as<muxc::ScrollViewer>(); sv && sv.Name() == L"SpacePagingScrollViewer") {
+            tabs = sv;
+            break;
+        }
+    if (!tabs) { ReturnTopTabs(st); return false; }
+    if (st.tabs.get() == tabs) {
+        // The original overlay can be hidden when Dia switches to its sidebar layout. The borrowed
+        // scroller no longer inherits that visibility, so check the original ancestors as well. Their
+        // size is intentionally ignored: removing the scroller can leave that overlay empty.
+        auto from = st.tabsFrom.get();
+        bool visible = from && from.IsLoaded() && from.XamlRoot() == root;
+        for (mux::DependencyObject p = from; visible && p; p = muxm::VisualTreeHelper::GetParent(p))
+            if (auto fe = p.try_as<mux::FrameworkElement>())
+                visible = fe.Visibility() == mux::Visibility::Visible && fe.Opacity() > 0;
+        if (!visible) { ReturnTopTabs(st); return false; }
+    }
+    if (st.tabs.get() != tabs) {
+        ReturnTopTabs(st);
+        auto from = muxm::VisualTreeHelper::GetParent(tabs).try_as<muxc::Panel>();
+        uint32_t index;
+        if (!from || !from.Children().IndexOf(tabs, index)) return false;
+        double height = (std::max)(tabs.ActualHeight(), strip.ActualHeight());
+        if (height < 1) return false;  // wait for Dia's native row to be measured before borrowing it
+        st.tabs = winrt::make_weak(tabs);
+        st.tabsFrom = winrt::make_weak(from);
+        st.tabsIndex = index;
+        st.tabsRow = SaveProp(tabs, muxc::Grid::RowProperty());
+        // ScrollViewer reports zero desired height in an Auto row: retain the height its native row gave it.
+        st.host.RowDefinitions().GetAt(1).MinHeight(height);
+        from.Children().RemoveAt(index);
+        muxc::Grid::SetRow(tabs, 1);
+        st.host.Children().Append(tabs);
+        Log("title bar: native top tabs moved below toolbar");
+    }
+    return true;
+}
+
+static void ReserveTitleButtons(TitleBarState& st, const muxc::Grid& main, bool topTabs) {
+    auto bar = st.bar.get();
+    if (!bar) return;
+    if (!topTabs) {
+        PutBack(st.topBarMargin);
+        st.topBarMargin = {};
+        return;
+    }
+    if (st.topBarMargin.el.get() != bar) {
+        PutBack(st.topBarMargin);
+        st.topBarMargin = SaveProp(bar, mux::FrameworkElement::MarginProperty());
+        st.topBarBase = bar.Margin();
+    }
+    double reserve = 0;
+    if (!Engine_TweakOn(L"hideWindowButtons"))
+        for (auto h : FindNodes(L"MinimizeButton"))
+            if (auto button = Obj<mux::FrameworkElement>(h); button && button.XamlRoot() == main.XamlRoot() &&
+                button.ActualWidth() > 0) {
+                reserve = (std::max)(0.0, main.ActualWidth() - button.TransformToVisual(main).TransformPoint({0, 0}).X);
+                break;
+            }
+    auto want = st.topBarBase;
+    want.Right += reserve;
+    auto cur = bar.Margin();
+    if (std::abs(cur.Right - want.Right) > 0.5) bar.Margin(want);
+}
 
 // lift: how far the toolbar was pulled up (0: not, or nothing up here). Dia's margin goes back at 0.
 static void LiftSidebarHeader(TitleBarState& st, const mux::XamlRoot& root, double lift) {
@@ -6185,6 +6280,8 @@ static void LiftSidebarHeader(TitleBarState& st, const mux::XamlRoot& root, doub
 }
 
 static void ReturnTitleBar(TitleBarState& st) {
+    PutBack(st.topBarMargin);
+    st.topBarMargin = {};
     auto bar = st.bar.get();
     auto from = st.from.get();
     if (bar) {
@@ -6192,8 +6289,10 @@ static void ReturnTitleBar(TitleBarState& st) {
             uint32_t i;
             if (cur.Children().IndexOf(bar, i)) cur.Children().RemoveAt(i);
         }
+        PutBack(st.toolbarGridRow);
         if (from) from.Children().InsertAt((std::min)(st.index, from.Children().Size()), bar);
     }
+    st.toolbarGridRow = {};
     if (st.row) st.row.MaxHeight(st.rowMax);
     st.row = nullptr;
     st.bar = nullptr;
@@ -6225,6 +6324,7 @@ static double AlignTitleBarTop(TitleBarState& st, const muxc::Grid& main) {
 
 static void RemoveTitleBar(TitleBarState& st) {
     if (auto main = st.main.get()) LiftSidebarHeader(st, main.XamlRoot(), 0);
+    ReturnTopTabs(st);
     ReturnTitleBar(st);
     if (auto main = st.main.get(); main && st.host) {
         uint32_t i;
@@ -6265,6 +6365,11 @@ static void UpdateTitleBar() {
             st.host = muxc::Grid();
             st.host.Name(L"diatweaksTitleBar");
             st.host.VerticalAlignment(mux::VerticalAlignment::Top);
+            muxc::RowDefinition toolbarRow, tabsRow;
+            toolbarRow.Height(mux::GridLengthHelper::Auto());
+            tabsRow.Height(mux::GridLengthHelper::Auto());
+            st.host.RowDefinitions().Append(toolbarRow);
+            st.host.RowDefinitions().Append(tabsRow);
             muxc::Grid::SetRow(st.host, 0);
             muxc::Grid::SetColumnSpan(st.host, (std::max)(1, (int)main.ColumnDefinitions().Size()));
             main.Children().Append(st.host);
@@ -6295,6 +6400,7 @@ static void UpdateTitleBar() {
         // None (its tab has left the screen: closed, or a page without a toolbar), or split view (the split
         // state can lag a pass behind): each pane keeps its own toolbar.
         if (shown != 1) {
+            ReturnTopTabs(st);
             if (ours) {
                 ReturnTitleBar(st);
                 if (shown > 1) Log("title bar: split view, toolbar back in its pane");
@@ -6313,12 +6419,14 @@ static void UpdateTitleBar() {
             st.bar = winrt::make_weak(active);
             st.from = winrt::make_weak(from);
             st.index = idx;
+            st.toolbarGridRow = SaveProp(active, muxc::Grid::RowProperty());
+            int r = muxc::Grid::GetRow(active);
+            muxc::Grid::SetRow(active, 0);
             // The toolbar's height as its pane gives it, kept up here: Centered (Arc for Windows) takes most of
             // its items into its strip, and in our Auto row the emptied toolbar shrank to a sliver (in the pane,
             // the row holds it). Never lowered: a tab's toolbar may come up already emptied.
             double barH = active.ActualHeight();
             // The pane's row holding the toolbar is closed up (its Height is Dia's, so its MaxHeight is capped).
-            int r = muxc::Grid::GetRow(active);
             if (r >= 0 && (uint32_t)r < from.RowDefinitions().Size()) {
                 auto row = from.RowDefinitions().GetAt(r);
                 if (row.Height().GridUnitType == mux::GridUnitType::Pixel) barH = (std::max)(barH, row.Height().Value);
@@ -6328,11 +6436,20 @@ static void UpdateTitleBar() {
                 Log("title bar: moved; pane row %d capped (max %.0f -> %.0f), toolbar %.0f px", r, st.rowMax,
                     row.MaxHeight(), barH);
             }
-            if (barH > st.barHeight) st.barHeight = barH, st.host.MinHeight(barH);
+            if (barH > st.barHeight) {
+                st.barHeight = barH;
+                st.host.RowDefinitions().GetAt(0).MinHeight(barH);
+            }
             st.host.Children().Append(active);
         }
+        bool topTabs = PlaceTopTabs(st, root);
+        ReserveTitleButtons(st, main, topTabs);
         double lift = AlignTitleBarTop(st, main);
         if (lift >= 0) {
+            if (topTabs) {
+                LiftSidebarHeader(st, root, 0);
+                continue;
+            }
             // The sidebar's top row (logo, space name...) is centered on the toolbar: Dia's own layout has it
             // 2 px higher than the toolbar's buttons (a 44 px row against a 40 px toolbar 4 px lower), so it's
             // measured rather than lifted by the toolbar's lift.

@@ -6214,7 +6214,8 @@ static void UpdateHiddenToolbar() {
     UpdateCaptionsForToolbar();
 }
 
-// Dia also lays an invisible window over the toolbar strip (BoostBrowser.WindowCaptionInputSink) that
+// Dia also lays an invisible window over the toolbar strip (BoostBrowser.WindowCaptionInputSink before
+// Dia 1.6, BoostBrowser.NativeCaptionInputWindow since) that
 // turns presses there into window drags. With the toolbar hidden the page sits under it, so its shape is
 // cut down to the sidebar part; Dia's own shape is put back when the toolbar shows.
 struct SinkState {
@@ -6230,7 +6231,8 @@ static HWND FindSink(HWND top) {
     EnumChildWindows(top, [](HWND h, LPARAM lp) -> BOOL {
         wchar_t cls[64];
         GetClassNameW(h, cls, 64);
-        if (wcscmp(cls, L"BoostBrowser.WindowCaptionInputSink") == 0) {
+        if (wcscmp(cls, L"BoostBrowser.WindowCaptionInputSink") == 0 ||
+            wcscmp(cls, L"BoostBrowser.NativeCaptionInputWindow") == 0) {  // (its name since Dia 1.6)
             reinterpret_cast<Ctx*>(lp)->found = h;
             return FALSE;
         }

@@ -243,13 +243,18 @@ bool LightTheme() {
 std::atomic<COLORREF> g_cardColor{CLR_INVALID};
 
 // Your sidebar's colour: the average of a small patch of the screen low in the sidebar, left of the page
-// (clear of its tabs and buttons).
-COLORREF SidebarColor(const RECT& page) {
+// (clear of its tabs and buttons). Only points on Dia's own window count: with the sidebar hidden, left of
+// the page is the window's edge or whatever is behind the window (the desktop), and that isn't Dia's colour.
+COLORREF SidebarColor(HWND dia, const RECT& page) {
+    RECT wr{};
+    GetWindowRect(dia, &wr);
     HDC dc = GetDC(nullptr);
     int r = 0, g = 0, b = 0, n = 0;
     for (int dy = 0; dy < 5; dy++)
         for (int dx = 0; dx < 5; dx++) {
-            COLORREF c = GetPixel(dc, page.left - 40 + dx * 4, page.bottom - 60 + dy * 4);
+            POINT pt{page.left - 40 + dx * 4, page.bottom - 60 + dy * 4};
+            if (!PtInRect(&wr, pt) || GetAncestor(WindowFromPoint(pt), GA_ROOT) != dia) continue;
+            COLORREF c = GetPixel(dc, pt.x, pt.y);
             if (c == CLR_INVALID) continue;
             r += GetRValue(c), g += GetGValue(c), b += GetBValue(c), n++;
         }
@@ -1874,14 +1879,13 @@ DWORD WINAPI GlanceThread(LPVOID ready) {
     g_ctl = G.ctl;
     SetEvent((HANDLE)ready);
     // Paced to the display: a frame, then wait for the next composition (DwmFlush); idle, just messages.
+    // Idle, it waits for any message, sent ones too: GM_CLOSE and the rest are sent from Dia's thread, and
+    // GetMessage handles a sent message without returning, so the close would get no frames (the backdrop
+    // and preview stuck on the screen) until something was posted.
     bool moving = false;
     for (;;) {
         MSG m;
-        if (!moving) {
-            if (GetMessageW(&m, nullptr, 0, 0) <= 0) break;
-            TranslateMessage(&m);
-            DispatchMessageW(&m);
-        }
+        if (!moving) MsgWaitForMultipleObjectsEx(0, nullptr, INFINITE, QS_ALLINPUT, MWMO_INPUTAVAILABLE);
         while (PeekMessageW(&m, nullptr, 0, 0, PM_REMOVE)) {
             if (m.message == WM_QUIT) return 0;
             TranslateMessage(&m);
@@ -2853,7 +2857,7 @@ bool Open(HWND widget, POINT click, const std::wstring& url, bool warm = false) 
     if (!page || !dia || IsIconic(dia)) return false;
     RECT target, pr;
     if (!CardRectFor(page, dia, target, &pr)) return false;
-    g_cardColor = SidebarColor(pr);
+    g_cardColor = SidebarColor(dia, pr);
     EnsureGlanceThread();
     if (!g_ctl) return false;
     if (!g_cbt) g_cbt = SetWindowsHookExW(WH_CBT, CbtHook, nullptr, GetCurrentThreadId());

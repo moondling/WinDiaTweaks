@@ -50,7 +50,7 @@ diagnostics API. From there:
   first movement ~10-25 ms after the pointer reaches the top. Typing in the address bar (Ctrl+L) also keeps
   the toolbar out.
 - With the toolbar hidden (Hide toolbar / Arc URL bar), Dia's invisible window-drag strip over the old toolbar
-  (`BoostBrowser.WindowCaptionInputSink`) is reshaped to cover only the sidebar, so the top of the page takes
+  (`BoostBrowser.WindowCaptionInputSink`, `BoostBrowser.NativeCaptionInputWindow` since Dia 1.6) is reshaped to cover only the sidebar, so the top of the page takes
   clicks; Dia's own shape comes back when the toolbar shows. On Dia's start page (New Tab), which is drawn in
   XAML, the toolbar slide runs as a compositor translation with the page height kept constant, so it doesn't
   re-lay out the start page every frame.

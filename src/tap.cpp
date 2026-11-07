@@ -110,6 +110,7 @@ static std::vector<Tweak> g_tweaks;
 static bool g_safeMode = false;
 static void CheckSafeMode();
 static DWORD WINAPI StableTimer(LPVOID);
+static void ApplyPinnedExtensionsLimit();
 static std::vector<Rule> g_rules;
 // (ui thread, type, value) -> value instance. Value handles belong to the XAML island they were made
 // in, so they are kept per thread and thrown away whenever the config reloads.
@@ -137,6 +138,8 @@ static std::vector<std::wstring> Tokens(const std::wstring& s) {
     return out;
 }
 
+static bool g_startRecorded = false;
+static std::map<std::wstring, std::wstring> g_startStates;
 static void LoadConfig() {
     std::vector<Tweak> tweaks;
     std::vector<Rule> rules;
@@ -164,6 +167,7 @@ static void LoadConfig() {
         if (line.rfind(L"icon:", 0) == 0) { cur->icon = Trim(line.substr(5)); continue; }
         if (line.rfind(L"value:", 0) == 0) { cur->value = Trim(line.substr(6)); continue; }
         if (line.rfind(L"switch:", 0) == 0) { cur->noSwitch = Trim(line.substr(7)) == L"none"; continue; }
+        if (line.rfind(L"restart:", 0) == 0) { cur->restart = Trim(line.substr(8)) == L"yes"; continue; }
         if (line.rfind(L"choices:", 0) == 0) {
             std::wstringstream cs(line.substr(8));
             std::wstring part;
@@ -201,6 +205,12 @@ static void LoadConfig() {
         }
     }
     std::lock_guard<std::recursive_mutex> lk(g_mx);
+    // What "restart: yes" tweaks were set to as Dia started: that's what is in effect until it reopens.
+    if (!g_startRecorded) {
+        g_startRecorded = true;
+        for (auto& t : tweaks)
+            if (t.restart) g_startStates[t.key] = t.enabled && !g_safeMode ? t.value : L"off";
+    }
     g_tweaks = tweaks;
     g_rules = rules;
     g_valueCache.clear();
@@ -821,6 +831,7 @@ public:
         CheckSafeMode();
         CloseHandle(CreateThread(nullptr, 0, StableTimer, nullptr, 0, nullptr));
         LoadConfig();
+        ApplyPinnedExtensionsLimit();
         CloseHandle(CreateThread(nullptr, 0, CommandThread, nullptr, 0, nullptr));
         // Advise must not run on the thread that called SetSite (it would deadlock).
         AddRef();
@@ -911,6 +922,14 @@ std::vector<TweakInfo> Engine_Tweaks() {
 bool Engine_TweakOn(const std::wstring& key) {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
     return TweakOn(key);
+}
+bool Engine_NeedsRestart(const std::wstring& key) {
+    std::lock_guard<std::recursive_mutex> lk(g_mx);
+    auto start = g_startStates.find(key);
+    if (start == g_startStates.end()) return false;
+    for (auto& t : g_tweaks)
+        if (t.key == key) return (t.enabled ? t.value : L"off") != start->second;
+    return false;
 }
 std::wstring Engine_TweakValue(const std::wstring& key) {
     std::lock_guard<std::recursive_mutex> lk(g_mx);
@@ -1214,6 +1233,58 @@ static bool TryAttach() {
 
 // Attaches, and if that fails, waits for diatweaks to ask for another try (it does when it finds us
 // loaded but not attached) instead of leaving Dia untweaked for good.
+// ---------------------------------------------------------------- pinned extensions shown
+// Dia's toolbar shows at most 4 pinned extensions: PinnedExtensionsViewModel takes min(count, 4) in two
+// places and shows the overflow button from 5. The pinnedExtensions tweak raises those numbers in
+// Dia's code in memory (Dia's files aren't touched), once, when the add-on attaches at startup.
+// The code is found by its bytes; if a Dia update changes it, nothing is patched and that's logged.
+static bool PatchBytes(uint8_t* at, const uint8_t* want, size_t len) {
+    DWORD old;
+    if (!VirtualProtect(at, len, PAGE_EXECUTE_READWRITE, &old)) return false;
+    memcpy(at, want, len);
+    VirtualProtect(at, len, old, &old);
+    FlushInstructionCache(GetCurrentProcess(), at, len);
+    return true;
+}
+
+// Finds the one place `pat` occurs in [lo, hi), or nullptr if it's missing or occurs more than once.
+static uint8_t* FindOnce(uint8_t* lo, uint8_t* hi, const uint8_t* pat, size_t len) {
+    uint8_t* p = std::search(lo, hi, pat, pat + len);
+    if (p == hi || std::search(p + 1, hi, pat, pat + len) != hi) return nullptr;
+    return p;
+}
+
+static void ApplyPinnedExtensionsLimit() {
+    if (!Engine_TweakOn(L"pinnedExtensions")) return;
+    int cap = _wtoi(Engine_TweakValue(L"pinnedExtensions").c_str());
+    if (cap <= 4 || cap > 100) return Log("pinned extensions: %d ignored", cap);
+    auto dia = (uint8_t*)GetModuleHandleW(L"Dia.dll");
+    if (!dia) return Log("pinned extensions: Dia.dll not loaded");
+    auto nt = (IMAGE_NT_HEADERS*)(dia + ((IMAGE_DOS_HEADER*)dia)->e_lfanew);
+    // cmp rsi,4 / mov r14d,4 / cmovb r14,rsi   (then cmp rsi,5 for the overflow button)
+    static const uint8_t a[] = {0x48, 0x83, 0xfe, 0x04, 0x41, 0xbe, 0x04, 0x00, 0x00, 0x00, 0x4c, 0x0f, 0x42, 0xf6};
+    // cmp r15,4 / mov edx,4 / cmovb rdx,r15
+    static const uint8_t b[] = {0x49, 0x83, 0xff, 0x04, 0xba, 0x04, 0x00, 0x00, 0x00, 0x49, 0x0f, 0x42, 0xd7};
+    static const uint8_t c[] = {0x48, 0x83, 0xfe, 0x05};
+    auto sec = IMAGE_FIRST_SECTION(nt);
+    for (int s = 0; s < nt->FileHeader.NumberOfSections; s++, sec++) {
+        if (memcmp(sec->Name, ".text", 6)) continue;
+        uint8_t *lo = dia + sec->VirtualAddress, *hi = lo + sec->Misc.VirtualSize;
+        uint8_t* pa = FindOnce(lo, hi, a, sizeof(a));
+        uint8_t* pb = FindOnce(lo, hi, b, sizeof(b));
+        uint8_t* pc = pa ? FindOnce(pa, pa + 64, c, sizeof(c)) : nullptr;
+        if (!pa || !pb || !pc) return Log("pinned extensions: Dia's code not found (Dia changed?), not patched");
+        uint8_t na[sizeof(a)], nb[sizeof(b)], nc[sizeof(c)];
+        memcpy(na, a, sizeof(a)), memcpy(nb, b, sizeof(b)), memcpy(nc, c, sizeof(c));
+        na[3] = na[6] = (uint8_t)cap;
+        nb[3] = nb[5] = (uint8_t)cap;
+        nc[3] = (uint8_t)(cap + 1);
+        bool ok = PatchBytes(pa, na, sizeof(na)) && PatchBytes(pb, nb, sizeof(nb)) && PatchBytes(pc, nc, sizeof(nc));
+        Log("pinned extensions: up to %d (%s)", cap, ok ? "patched" : "patch FAILED");
+        return;
+    }
+}
+
 static DWORD WINAPI Bootstrap(LPVOID) {
     HANDLE retry =
         CreateEventW(nullptr, FALSE, FALSE, (DT_EVENT_RETRY + std::to_wstring(GetCurrentProcessId())).c_str());

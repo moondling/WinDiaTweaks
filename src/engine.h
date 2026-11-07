@@ -15,6 +15,7 @@ struct TweakInfo {
     std::vector<std::pair<std::wstring, std::wstring>> choices;  // value -> label
     bool enabled = false;
     bool noSwitch = false;  // "switch: none": its drop-down only (an option of another tweak)
+    bool restart = false;   // "restart: yes": takes effect when Dia next opens (Settings offers to reopen it)
 };
 
 // ---- provided by tap.cpp
@@ -23,6 +24,8 @@ std::wstring Engine_Dir();
 std::vector<TweakInfo> Engine_Tweaks();
 bool Engine_TweakOn(const std::wstring& key);
 std::wstring Engine_TweakValue(const std::wstring& key);
+// For a "restart: yes" tweak: true while its setting differs from the one Dia was started with.
+bool Engine_NeedsRestart(const std::wstring& key);
 // Writes tweaks.conf and applies it right away. value may be null (leave as is).
 void Engine_SetTweak(const std::wstring& key, bool on, const std::wstring* value);
 void Engine_SetAll(bool on);

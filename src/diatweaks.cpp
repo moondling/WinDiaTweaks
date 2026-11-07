@@ -1536,6 +1536,17 @@ int wmain(int argc, wchar_t** argv) {
                         L"WinDiaTweaks", MB_OK | MB_ICONWARNING);
         return r;
     }
+    // Settings' "Reopen Dia" button.
+    if (cmd == L"restart") {
+        CleanUpAfterUpdate();
+        // Reopening on purpose isn't a crash: don't let quick reopens count toward safe mode.
+        DeleteFileW((g_dir + L"\\launch.state").c_str());
+        int r = StartTweaked(true) ? 0 : 1;
+        if (r)
+            MessageBoxW(nullptr, L"Dia didn't reopen with WinDiaTweaks. Open it with Dia (Tweaks), or see tap.log.",
+                        L"WinDiaTweaks", MB_OK | MB_ICONWARNING);
+        return r;
+    }
 #endif
     if (cmd == L"version" || cmd == L"--version") return wprintf(L"%ls\n", WDT_VERSION), 0;
     if (cmd == L"check") return CmdCheck();

@@ -1629,8 +1629,35 @@ struct FieldHover {
     winrt::weak_ref<muxc::Border> bar;
     muxm::Brush dia{nullptr};
     int64_t token = 0;
+    winrt::event_token entered{}, exited{};
+    bool over = false;
 };
 static thread_local std::map<void*, FieldHover> t_fieldHover;
+
+struct DefaultTrailingHover {
+    mux::FrameworkElement stack{nullptr};
+    mux::Data::BindingBase opacityBinding{nullptr}, hitBinding{nullptr};
+    wf::IInspectable opacityLocal{nullptr}, hitLocal{nullptr};
+};
+static thread_local std::map<void*, DefaultTrailingHover> t_defaultTrailingHover;
+
+static void RestoreDefaultTrailing(void* id) {
+    auto it = t_defaultTrailingHover.find(id);
+    if (it == t_defaultTrailingHover.end()) return;
+    auto& s = it->second;
+    auto restore = [&](const mux::DependencyProperty& dp, const mux::Data::BindingBase& binding, const wf::IInspectable& local) {
+        if (binding) s.stack.SetBinding(dp, binding);
+        else if (local && local != mux::DependencyProperty::UnsetValue()) s.stack.SetValue(dp, local);
+        else s.stack.ClearValue(dp);
+    };
+    restore(mux::UIElement::OpacityProperty(), s.opacityBinding, s.opacityLocal);
+    restore(mux::UIElement::IsHitTestVisibleProperty(), s.hitBinding, s.hitLocal);
+    t_defaultTrailingHover.erase(it);
+}
+
+static void RestoreAllDefaultTrailing() {
+    while (!t_defaultTrailingHover.empty()) RestoreDefaultTrailing(t_defaultTrailingHover.begin()->first);
+}
 
 static muxm::Brush SidebarHoverBrush() {
     return BrushRes(L"SubtleFillColorSecondaryBrush", Rgba(0xff, 0xff, 0xff, 0x0f));
@@ -1667,9 +1694,48 @@ static void LookField(const muxc::Border& bar) {
             if (auto solid = cur.try_as<muxm::SolidColorBrush>())
                 if (auto neutral = want.try_as<muxm::SolidColorBrush>(); neutral && solid.Color() == neutral.Color()) return;
             it->second.dia = cur;
-            if (fixed || VisibleFill(cur)) b.Background(want);
+            if (fixed || it->second.over || VisibleFill(cur)) b.Background(want);
         });
         t_fieldHover[id] = f;
+        // In the title bar the address editor is click-through, so Dia cannot drive its usual
+        // hover state. Track the field itself when the native toolbar is selected.
+        auto hover = [id](bool over) {
+            if (!ToolbarSidebar() || Engine_TweakOn(L"arcUrlBar") || Engine_TweakOn(L"alwaysShowAddressField")) return;
+            auto it = t_fieldHover.find(id);
+            if (it == t_fieldHover.end()) return;
+            if (it->second.over == over) return;
+            it->second.over = over;
+            if (auto b = it->second.bar.get()) {
+                if (!over) RestoreDefaultTrailing(id);
+                else if (!t_defaultTrailingHover.count(id)) {
+                    if (auto stack = FindByName(b, L"UrlBarTrailingStack")) {
+                        DefaultTrailingHover state;
+                        state.stack = stack;
+                        auto opacity = mux::UIElement::OpacityProperty(), hit = mux::UIElement::IsHitTestVisibleProperty();
+                        if (auto be = stack.GetBindingExpression(opacity)) state.opacityBinding = be.ParentBinding();
+                        else state.opacityLocal = stack.ReadLocalValue(opacity);
+                        if (auto be = stack.GetBindingExpression(hit)) state.hitBinding = be.ParentBinding();
+                        else state.hitLocal = stack.ReadLocalValue(hit);
+                        t_defaultTrailingHover.emplace(id, state);
+                        stack.Opacity(1);
+                        stack.IsHitTestVisible(true);
+                    }
+                }
+                b.Background(over ? SidebarHoverBrush() : LookClear());
+            }
+        };
+        t_fieldHover[id].entered = bar.PointerEntered([hover](auto&&, auto&&) { hover(true); });
+        t_fieldHover[id].exited = bar.PointerExited([hover](wf::IInspectable const& sender,
+                                                           mux::Input::PointerRoutedEventArgs const& e) {
+            auto b = sender.try_as<muxc::Border>();
+            if (b) {
+                auto p = e.GetCurrentPoint(b).Position();
+                // PointerExited bubbles from children too. Moving from the field onto its star or
+                // menu must not clear and redraw the field's hover background.
+                if (p.X >= 0 && p.Y >= 0 && p.X < b.ActualWidth() && p.Y < b.ActualHeight()) return;
+            }
+            hover(false);
+        });
     }
     auto fixed = FixedAddressFill();
     if (fixed || VisibleFill(bar.Background())) bar.Background(fixed ? fixed : SidebarHoverBrush());
@@ -1783,10 +1849,13 @@ static winrt::Windows::UI::Color SiteColorFor(mux::DependencyObject d) {
 }
 
 static void PaletteRestoreAll() {
+    RestoreAllDefaultTrailing();
     AddressRestoreAll();
     for (auto& [id, f] : t_fieldHover)
         if (auto bar = f.bar.get()) {
             bar.UnregisterPropertyChangedCallback(muxc::Border::BackgroundProperty(), f.token);
+            bar.PointerEntered(f.entered);
+            bar.PointerExited(f.exited);
             if (bar.Background() == SidebarHoverBrush()) bar.Background(f.dia);
         }
     t_fieldHover.clear();
@@ -2150,7 +2219,9 @@ static bool ArcWindowsOn() { return Engine_TweakOn(L"arcUrlBar") && Engine_Tweak
 // --- Always show address field: the field's background and its buttons, not just on hover.
 struct FieldState {
     winrt::weak_ref<muxc::Border> bar;
-    muxm::Brush saved{nullptr};
+    mux::Data::BindingBase binding{nullptr};
+    wf::IInspectable local{nullptr};
+    int64_t token = 0;
 };
 struct ButtonsState {
     winrt::weak_ref<mux::FrameworkElement> stack;
@@ -2184,10 +2255,14 @@ static void UpdateAddressField() {
             for (auto& f : t_field)
                 if (f.bar.get() == bar) known = true;
             if (!known) {
-                t_field.push_back({winrt::make_weak(bar), bar.Background()});
+                FieldState state;
+                state.bar = winrt::make_weak(bar);
+                auto dp = muxc::Border::BackgroundProperty();
+                if (auto be = bar.GetBindingExpression(dp)) state.binding = be.ParentBinding();
+                else state.local = bar.ReadLocalValue(dp);
                 // Dia paints the field in the site's color on hover; put the neutral fill straight
                 // back, before the frame is drawn, so the tint never shows.
-                bar.RegisterPropertyChangedCallback(muxc::Border::BackgroundProperty(),
+                state.token = bar.RegisterPropertyChangedCallback(muxc::Border::BackgroundProperty(),
                                                     [](mux::DependencyObject const& o, auto&&) {
                                                         if (!Engine_TweakOn(L"alwaysShowAddressField") &&
                                                             !Engine_TweakOn(L"arcUrlBar"))
@@ -2198,6 +2273,7 @@ static void UpdateAddressField() {
                                                         auto w = want.try_as<muxm::SolidColorBrush>();
                                                         if (!cur || !w || cur.Color() != w.Color()) b.Background(want);
                                                     });
+                t_field.push_back(state);
             }
             if (bar.Background() != fill) bar.Background(fill);
             if (bar.CornerRadius().TopLeft < 1) bar.CornerRadius({8, 8, 8, 8});
@@ -2220,7 +2296,13 @@ static void UpdateAddressField() {
         }
     } else {
         for (auto& f : t_field)
-            if (auto bar = f.bar.get()) bar.Background(f.saved);
+            if (auto bar = f.bar.get()) {
+                auto dp = muxc::Border::BackgroundProperty();
+                bar.UnregisterPropertyChangedCallback(dp, f.token);
+                if (f.binding) bar.SetBinding(dp, f.binding);
+                else if (f.local && f.local != mux::DependencyProperty::UnsetValue()) bar.SetValue(dp, f.local);
+                else bar.ClearValue(dp);
+            }
         t_field.clear();
         RestoreAddressFieldButtons();
     }
@@ -4638,6 +4720,27 @@ static void AttachDisplay(ArcState& st, const mux::FrameworkElement& address) {
 
 // Dia keeps a separate toolbar for every tab. Find the one belonging to the tab on screen; if its
 // items are still in it (you just switched tabs), give the previous tab its items back and borrow these.
+static bool ToolbarReadyForMove(const mux::FrameworkElement& bar) {
+    struct Pending { winrt::weak_ref<mux::FrameworkElement> bar; double since = 0; };
+    static thread_local std::vector<Pending> pending;
+    std::erase_if(pending, [](auto& p) { return !p.bar.get(); });
+    if (!bar || !bar.IsLoaded()) return false;
+    auto address = FindByName(bar, L"AssistantBarHost");
+    auto menu = address ? FindByName(address, L"SiteMenuButton") : nullptr;
+    auto bookmark = address ? FindByName(address, L"BookmarkButton") : nullptr;
+    if (address && address.IsLoaded() && menu && menu.IsLoaded() && bookmark && bookmark.IsLoaded()) {
+        std::erase_if(pending, [&](auto& p) { return p.bar.get() == bar; });
+        return true;
+    }
+    auto it = std::find_if(pending.begin(), pending.end(), [&](auto& p) { return p.bar.get() == bar; });
+    if (it == pending.end()) {
+        pending.push_back({winrt::make_weak(bar), NowMs()});
+        return false;
+    }
+    // Some pages have no address controls; don't hold the toolbar back indefinitely.
+    return NowMs() - it->since >= 2000;
+}
+
 static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     auto paging = st.paging.get();
     auto left = st.left.get(), right = st.right.get(), url = st.url.get();
@@ -4647,7 +4750,7 @@ static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     std::vector<mux::FrameworkElement> bars;
     for (auto h : FindNodes(L"NavigationBarContent")) {
         auto fe = Obj<mux::FrameworkElement>(h);
-        if (fe && fe.XamlRoot() == root && ShownOnScreen(fe)) bars.push_back(fe);
+        if (fe && fe.IsLoaded() && fe.XamlRoot() == root && ShownOnScreen(fe)) bars.push_back(fe);
     }
     mux::FrameworkElement active{nullptr};
     if (bars.size() == 1) {
@@ -4714,6 +4817,7 @@ static void AdoptActiveTab(ArcState& st, bool sidebar = true) {
     auto reload = FindByName(active, L"ReloadButton");
     auto address = FindByName(active, L"AssistantBarHost");
     if (!back || !fwd || !reload || !address) return;
+    if (!ToolbarReadyForMove(active)) return;
     Log("arc: swap to new tab controls (%.0f)", NowMs());
     ReturnMoved(st);
     auto navStack = muxm::VisualTreeHelper::GetParent(back).try_as<muxc::Panel>();  // the toolbar's left part
@@ -5310,7 +5414,7 @@ struct ArcWinBar {
     std::vector<std::pair<winrt::weak_ref<mux::FrameworkElement>, muxm::Transform>> moved;
     muxc::StackPanel spaced{nullptr};
     muxc::Border siteGap{nullptr};
-    SavedProp nativeSpacing;
+    SavedProp nativeSpacing, stackColumn, stackSpan, stackAlignment, stackMargin;
     bool hover = false;
     // Dia's field (AssistantBarHost) clipped to the centered group, so only the group takes the pointer
     // (hover, click): (field, Dia's own clip)
@@ -5324,11 +5428,17 @@ struct ArcWinBar {
 };
 static thread_local std::map<InstanceHandle, ArcWinBar> t_arcWin;
 
+
 static void RestoreArcWinSpacing(ArcWinBar& b) {
     uint32_t index;
     if (b.spaced && b.siteGap && b.spaced.Children().IndexOf(b.siteGap, index)) b.spaced.Children().RemoveAt(index);
     PutBack(b.nativeSpacing);
+    PutBack(b.stackColumn);
+    PutBack(b.stackSpan);
+    PutBack(b.stackAlignment);
+    PutBack(b.stackMargin);
     b.nativeSpacing = {};
+    b.stackColumn = {}, b.stackSpan = {}, b.stackAlignment = {}, b.stackMargin = {};
     b.spaced = nullptr;
     b.siteGap = nullptr;
 }
@@ -5521,6 +5631,10 @@ static void LayoutArcWin(ArcWinBar& b) {
             RestoreArcWinSpacing(b);
             b.spaced = stack;
             b.nativeSpacing = SaveProp(stack, muxc::StackPanel::SpacingProperty());
+            b.stackColumn = SaveProp(stack, muxc::Grid::ColumnProperty());
+            b.stackSpan = SaveProp(stack, muxc::Grid::ColumnSpanProperty());
+            b.stackAlignment = SaveProp(stack, mux::FrameworkElement::HorizontalAlignmentProperty());
+            b.stackMargin = SaveProp(stack, mux::FrameworkElement::MarginProperty());
             b.siteGap = muxc::Border();
             b.siteGap.Name(L"diatweaksArcWinSiteGap");
             b.siteGap.IsHitTestVisible(false);
@@ -5532,10 +5646,25 @@ static void LayoutArcWin(ArcWinBar& b) {
                 if (present) b.spaced.Children().RemoveAt(current);
                 if (b.spaced.Children().IndexOf(buttons[0], first)) b.spaced.Children().InsertAt(first + 1, b.siteGap);
             }
-            b.spaced.Spacing(gap);
+            if (b.spaced.Spacing() != gap) b.spaced.Spacing(gap);
             if (b.siteGap.Width() != w + 2 * pad) b.siteGap.Width(w + 2 * pad);
-            b.spaced.UpdateLayout();
-            SlideTo(b, b.spaced, bar, x);
+            if (auto parent = muxm::VisualTreeHelper::GetParent(b.spaced).try_as<muxc::Grid>()) {
+                // Keep Dia's buttons at their actual layout positions. A render transform looks right
+                // and passes XAML hit testing, but Dia's native button actions use the old positions.
+                if (muxc::Grid::GetColumn(b.spaced) != 0) muxc::Grid::SetColumn(b.spaced, 0);
+                int span = (std::max)(1, (int)parent.ColumnDefinitions().Size());
+                if (muxc::Grid::GetColumnSpan(b.spaced) != span) muxc::Grid::SetColumnSpan(b.spaced, span);
+                if (b.spaced.HorizontalAlignment() != mux::HorizontalAlignment::Left)
+                    b.spaced.HorizontalAlignment(mux::HorizontalAlignment::Left);
+                double parentX = parent.TransformToVisual(bar).TransformPoint({0, 0}).X;
+                auto margin = b.spaced.Margin();
+                double left = (std::max)(0.0, x - parentX);
+                if (std::abs(margin.Left - left) > 0.5 || margin.Right != 0)
+                    b.spaced.Margin({left, margin.Top, 0, margin.Bottom});
+                bool tracked = false;
+                for (auto& [element, transform] : b.moved) tracked |= element.get() == b.spaced;
+                if (!tracked) b.moved.push_back({winrt::make_weak(b.spaced.as<mux::FrameworkElement>()), b.spaced.RenderTransform()});
+            }
         }
     } else {
         PutBackArcWinButtons(b);
@@ -5896,6 +6025,10 @@ static void UpdateArcWindows() {
 // Otherwise Sidebar can save Centered's empty text clip as Dia's original value.
 static void UpdateCaptionTrim();
 static void UpdateAddressBars() {
+    if (Engine_TweakOn(L"arcUrlBar") || !ToolbarSidebar()) {
+        RestoreAllDefaultTrailing();
+        for (auto& [id, state] : t_fieldHover) state.over = false;
+    }
     if (Engine_TweakOn(L"arcUrlBar")) RestoreAddressFieldButtons();
     if (!ArcWindowsOn()) UpdateArcWindows();
     UpdateArcBar();
@@ -6754,6 +6887,7 @@ static void UpdateTitleBar() {
         }
         auto active = oursShown ? ours : bars[0];
         if (active != ours) {
+            if (!ToolbarReadyForMove(active)) continue;
             // Another tab's toolbar comes up: give back the one we have.
             auto from = muxm::VisualTreeHelper::GetParent(active).try_as<muxc::Grid>();
             uint32_t idx;
@@ -7773,27 +7907,18 @@ static void TrimSink(HWND top, bool trim, int pageLeftPx) {
     DeleteObject(cur);
 }
 
-// The top-level Dia window showing this XAML root: one of this thread's WinUI windows with a caption
-// sink, whose client size matches the root's.
+// The top-level window owning this XAML root. Multiple windows can have the same client size.
 static HWND TopWindowFor(const mux::XamlRoot& root) {
-    struct Ctx { double w, h; HWND best = nullptr; double bestDiff = 1e9; } ctx;
-    if (!root) return nullptr;  // (a window being made or closed: calling through null would crash)
-    auto sz = root.Size();
-    double scale = root.RasterizationScale();
-    ctx.w = sz.Width * scale;
-    ctx.h = sz.Height * scale;
-    EnumThreadWindows(GetCurrentThreadId(), [](HWND h, LPARAM lp) -> BOOL {
-        auto& c = *reinterpret_cast<Ctx*>(lp);
-        wchar_t cls[64];
-        GetClassNameW(h, cls, 64);
-        if (wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0 || !FindSink(h)) return TRUE;
-        RECT r;
-        GetClientRect(h, &r);
-        double d = std::abs((r.right - r.left) - c.w) + std::abs((r.bottom - r.top) - c.h);
-        if (d < c.bestDiff) c.bestDiff = d, c.best = h;
-        return TRUE;
-    }, (LPARAM)&ctx);
-    return ctx.best;
+    if (!root) return nullptr;
+    try {
+        auto environment = root.ContentIslandEnvironment();
+        if (!environment) return nullptr;
+        auto id = environment.AppWindowId();
+        HWND top = GetAncestor((HWND)(uintptr_t)id.Value, GA_ROOT);
+        return top && IsWindow(top) ? top : nullptr;
+    } catch (...) {
+        return nullptr;
+    }
 }
 
 static std::vector<winrt::Windows::Graphics::RectInt32> RegularToolbarClickRects(const mux::XamlRoot& root) {
@@ -7908,6 +8033,8 @@ static std::vector<winrt::Windows::Graphics::RectInt32> ToolbarDragRects(const m
     return out;
 }
 
+static std::vector<winrt::Windows::Graphics::RectInt32> ArcHeaderButtons(const mux::XamlRoot& root);
+
 static void UpdateArcWinCaption(CaptionState& c, const mux::XamlRoot& root) {
     if (!c.src) return;
     using R = winrt::Windows::Graphics::RectInt32;
@@ -7933,6 +8060,22 @@ static void UpdateArcWinCaption(CaptionState& c, const mux::XamlRoot& root) {
     }
     if (!c.arcOn || !same(cur, c.arcApplied)) c.arcDia = cur;  // Dia set new ones (or first time)
     std::vector<R> want = c.arcDia;
+    // Dia's saved caption regions can describe an earlier toolbar layout. In particular, switching
+    // from Centered back to Dia's toolbar can leave them over the restored controls until a tab change.
+    // Keep those native regions everywhere else, but give the current controls their pointer input.
+    for (auto cut : ArcHeaderButtons(root)) {
+        std::vector<R> pieces;
+        for (auto rect : want) {
+            int left = (std::max)(rect.X, cut.X), right = (std::min)(rect.X + rect.Width, cut.X + cut.Width);
+            int top = (std::max)(rect.Y, cut.Y), bottom = (std::min)(rect.Y + rect.Height, cut.Y + cut.Height);
+            if (left >= right || top >= bottom) { pieces.push_back(rect); continue; }
+            if (rect.Y < top) pieces.push_back({rect.X, rect.Y, rect.Width, top - rect.Y});
+            if (bottom < rect.Y + rect.Height) pieces.push_back({rect.X, bottom, rect.Width, rect.Y + rect.Height - bottom});
+            if (rect.X < left) pieces.push_back({rect.X, top, left - rect.X, bottom - top});
+            if (right < rect.X + rect.Width) pieces.push_back({right, top, rect.X + rect.Width - right, bottom - top});
+        }
+        want = std::move(pieces);
+    }
     want.insert(want.end(), mine.begin(), mine.end());
     if (c.arcOn && same(want, cur)) return;
     c.self = true;
@@ -8246,11 +8389,13 @@ static void HookAddressClicks() {
                                                   [](auto& w) { return !w.get(); }),
                                    t_addressClickHooked.end());
         t_addressClickHooked.push_back(winrt::make_weak(bar));
-        bar.AddHandler(mux::UIElement::TappedEvent(),
-                       winrt::box_value(mux::Input::TappedEventHandler([](wf::IInspectable const&,
-                                                                            mux::Input::TappedRoutedEventArgs const& e) {
+        bar.AddHandler(mux::UIElement::PointerPressedEvent(),
+                       winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& sender,
+                                                                             mux::Input::PointerRoutedEventArgs const& e) {
                            try {
                                if (!TitleBarMoveOn() || ArcWindowsOn()) return;
+                               auto bar = sender.try_as<mux::UIElement>();
+                               if (!bar || !e.GetCurrentPoint(bar).Properties().IsLeftButtonPressed()) return;
                                for (auto d = e.OriginalSource().try_as<mux::DependencyObject>(); d;
                                     d = muxm::VisualTreeHelper::GetParent(d)) {
                                    if (d.try_as<muxc::Primitives::ButtonBase>()) return;
@@ -8258,6 +8403,7 @@ static void HookAddressClicks() {
                                }
                                // Ctrl+L is sent as keys: with Shift or Alt held Dia would get another shortcut.
                                if ((GetAsyncKeyState(VK_SHIFT) | GetAsyncKeyState(VK_MENU)) & 0x8000) return;
+                               e.Handled(true);
                                OpenCommandBar();
                            } catch (...) {
                            }

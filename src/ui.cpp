@@ -53,6 +53,7 @@
 #include <audioclient.h>
 
 #include "engine.h"
+#include "llhook.h"
 
 namespace wf = winrt::Windows::Foundation;
 namespace mux = winrt::Microsoft::UI::Xaml;
@@ -5530,7 +5531,9 @@ static void StyleStartPages() {
 
 static thread_local bool t_newTabMode = false;
 static bool InNewTabMode() { return t_newTabMode; }
-static thread_local bool t_passCtrlT = false;     // let our own Ctrl+T through to Dia once
+// Read by the key hook, on its own thread (see ArcKeyHook):
+static std::atomic<bool> g_arcPassCtrlT{false};     // let our own Ctrl+T through to Dia once
+static std::atomic<bool> g_arcEnterSubmits{false};  // new-tab mode, its box focused: Enter opens a new tab
 static thread_local std::wstring t_pendingQuery;  // text to submit in the new tab
 static thread_local int t_submitFrames = 0;
 static thread_local winrt::event_token t_submitToken{};
@@ -5605,6 +5608,7 @@ static void StartNewTabMode() {
         bool done = --t_clearFrames <= 0;
         if (auto q = FocusedQueryBox()) {
             if (auto reb = q.try_as<muxc::RichEditBox>()) reb.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, L"");
+            g_arcEnterSubmits = t_newTabMode;
             done = true;
         }
         if (done) {
@@ -5641,6 +5645,7 @@ static void SubmitInNewTab() {
     std::wstring text(raw);
     while (!text.empty() && iswspace(text.back())) text.pop_back();
     t_newTabMode = false;
+    g_arcEnterSubmits = false;
     SendKeys({{VK_ESCAPE, true}, {VK_ESCAPE, false}});
     if (text.empty()) return;
     OpenTextInNewTab(text);
@@ -5651,7 +5656,7 @@ static void OpenTextInNewTab(const std::wstring& text) {
     t_pendingQuery = text;
     t_relayText = text;
     if (ArcWindowsOn()) LayoutArcWinSafe([](const ArcWinBar&) { return true; });  // the new address, now
-    t_passCtrlT = true;
+    g_arcPassCtrlT = true;
     bool ctrlHeld = GetAsyncKeyState(VK_CONTROL) & 0x8000;
     if (ctrlHeld) SendKeys({{'T', true}, {'T', false}});
     else SendKeys({{VK_CONTROL, true}, {'T', true}, {'T', false}, {VK_CONTROL, false}});
@@ -5716,7 +5721,7 @@ static void OpenTextInNewTab(const std::wstring& text) {
             muxm::CompositionTarget::Rendering(t_submitToken);
             t_submitToken = {};
             t_pendingQuery.clear();
-            t_passCtrlT = false;
+            g_arcPassCtrlT = false;
             t_enterIn = -1;
             if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // gave up: never leave it hidden
             if (!t_hiddenPage.get() && !t_unhideToken) t_relayText.clear(), ScheduleArcAdopt();
@@ -5733,8 +5738,13 @@ void Ui_OpenInNewTab(const std::wstring& text) {
 
 static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     try {
-        if (msg == WM_ARC_CTRL_T) StartNewTabMode();
-        else if (msg == WM_ARC_ENTER) SubmitInNewTab();
+        if (msg == WM_ARC_CTRL_T) {
+            StartNewTabMode();
+        } else if (msg == WM_ARC_ENTER) {
+            // The hook went by a flag up to a tick old: focus left the box since, so give the Enter back.
+            if (t_newTabMode && FocusedQueryBox()) SubmitInNewTab();
+            else g_arcEnterSubmits = false, SendKeys({{VK_RETURN, true}, {VK_RETURN, false}});
+        }
     } catch (...) {
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -5746,21 +5756,23 @@ static bool DiaIsForeground() {
     return pid == GetCurrentProcessId();
 }
 
-// Low-level keyboard hook (runs on this UI thread's message loop). Only acts while Dia is the active app.
+// Low-level keyboard hook, on a thread of its own (see llhook.h): it must not touch XAML or the UI
+// thread's state, only the atomics above. Set only while Floating New Tab is on; acts only while Dia is
+// the active app.
 static LRESULT CALLBACK ArcKeyHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         // (Our own Ctrl+L / Alt+Enter never match below, so they can't loop.)
-        if (Engine_TweakOn(L"floatingNewTab") && DiaIsForeground()) {
+        if ((k->vkCode == 'T' || k->vkCode == VK_RETURN) && DiaIsForeground()) {
             bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000,
                  shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
-            if (k->vkCode == 'T' && ctrl && !alt && !shift && t_passCtrlT) {
-                t_passCtrlT = false;  // our own new-tab request: Dia handles this one
+            if (k->vkCode == 'T' && ctrl && !alt && !shift && g_arcPassCtrlT.exchange(false)) {
+                // our own new-tab request: Dia handles this one
             } else if (k->vkCode == 'T' && ctrl && !alt && !shift) {
                 PostMessageW(g_arcMsgWnd, WM_ARC_CTRL_T, 0, 0);
                 return 1;  // Dia never sees it: no New Tab page
             }
-            if (k->vkCode == VK_RETURN && !ctrl && !alt && !shift && t_newTabMode && FocusedQueryBox()) {
+            if (k->vkCode == VK_RETURN && !ctrl && !alt && !shift && g_arcEnterSubmits.exchange(false)) {
                 PostMessageW(g_arcMsgWnd, WM_ARC_ENTER, 0, 0);
                 return 1;
             }
@@ -5769,23 +5781,39 @@ static LRESULT CALLBACK ArcKeyHook(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
-static void InstallArcKeys() {
-    if (g_arcMsgWnd) return;
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = ArcMsgProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"DiaTweaksArcKeys";
-    RegisterClassW(&wc);
-    g_arcMsgWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&ArcKeyHook, &self);
-    if (!SetWindowsHookExW(WH_KEYBOARD_LL, ArcKeyHook, self, 0)) Log("Arc keys: hook failed %lu", GetLastError());
+static LowLevelHookThread g_arcHooks;
+static DWORD g_arcThread = 0;  // the UI thread that owns the message window (and new-tab mode)
+
+// The key hook while Floating New Tab is on; none (no cost to your typing) while it's off.
+static void SetArcKeys(bool on) {
+    if (!g_arcThread) {
+        if (!on) return;
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = ArcMsgProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"DiaTweaksArcKeys";
+        RegisterClassW(&wc);
+        g_arcMsgWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+        g_arcThread = GetCurrentThreadId();
+    }
+    if (GetCurrentThreadId() != g_arcThread) return;
+    static bool failed = false;  // (not tried again every tick: once more after the tweak is turned off and on)
+    if (!on) failed = false;
+    if (on == g_arcHooks.Running() || (on && failed)) return;
+    if (!on) {
+        g_arcHooks.Stop();
+        g_arcPassCtrlT = false;
+        g_arcEnterSubmits = false;
+    } else if (!g_arcHooks.Start(nullptr, ArcKeyHook)) {
+        failed = true;
+        Log("Arc keys: hook failed %lu", g_arcHooks.Error());
+    }
 }
 
-// The empty-bar mode ends when the command bar closes.
+// The empty-bar mode ends when the command bar closes. (And the key hook hears where it stands.)
 static void UpdateNewTabMode() {
     if (t_newTabMode && !t_clearToken && !FocusedQueryBox()) t_newTabMode = false;
+    g_arcEnterSubmits = t_newTabMode && !t_clearToken;  // (the box is focused: just checked)
 }
 
 // ---------------------------------------------------------------- window buttons (minimize/maximize/close)
@@ -6560,7 +6588,7 @@ bool Ui_Tick() {
         stage = "hiddenToolbar";
         UpdateHiddenToolbar();
         stage = "commandBar";
-        if (Engine_TweakOn(L"floatingNewTab")) InstallArcKeys();
+        SetArcKeys(Engine_TweakOn(L"floatingNewTab"));
         if ((Engine_TweakOn(L"floatingNewTab") || ArcWindowsOn()) && !ArcSidebarOn())
             HookCommandBarPopovers();  // (Arc mode hooks them already)
         stage = "newTab";

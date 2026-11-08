@@ -3921,6 +3921,9 @@ struct ArcState {
     // Dia header values we changed to line the row up (logo icon, panel placement): put back on off.
     std::vector<std::tuple<winrt::weak_ref<mux::DependencyObject>, mux::DependencyProperty, wf::IInspectable>> headerStyle;
     winrt::weak_ref<mux::FrameworkElement> overflowWatched;
+    // ☆ / ⋯ moved so ⋯ sits flush in the pill's corner: the stack, and Dia's own RenderTransform for it.
+    winrt::weak_ref<mux::UIElement> flushed;
+    muxm::Transform flushedTransform{nullptr};
 };
 static thread_local std::map<InstanceHandle, ArcState> t_arc;
 
@@ -3966,6 +3969,9 @@ static void ReturnMoved(ArcState& st) {
     for (auto& [w, dp, v] : st.iconTint)
         if (auto o = w.get()) o.SetValue(dp, v);
     st.iconTint.clear();
+    if (auto f = st.flushed.get()) f.RenderTransform(st.flushedTransform);
+    st.flushed = nullptr;
+    st.flushedTransform = nullptr;
     st.trailingShown = true;
     if (auto d = st.display.get()) {
         d.Opacity(st.displayOpacity);
@@ -4046,29 +4052,23 @@ static void ArcOff(ArcState& st) {
 }
 
 // Keeps the pill's label in step with Dia's address text and clear of the ☆ / ⋯ buttons.
-// Is the mouse pointer over this element right now (and over its window, not something on top)?
-static bool PointerInside(const mux::FrameworkElement& el) {
+// Has the mouse pointer left this element's window for another app (or the desktop)? Inside Dia's own
+// windows XAML's pointer events track hover exactly (see TrackArcPointer); this only catches a leave
+// they missed. It never decides from screen coordinates: converting those to XAML's got it wrong while
+// the pointer was on the pill, which hid the ☆ / ⋯ buttons (and cancelled a click mid-press).
+static bool PointerLeftWindow(const mux::FrameworkElement& el) {
     POINT pt;
-    if (!el) return false;
-    auto xamlRoot = el.XamlRoot();
-    if (!xamlRoot || !GetCursorPos(&pt)) return false;
+    if (!el || !el.XamlRoot() || !GetCursorPos(&pt)) return false;
     HWND under = WindowFromPoint(pt);
     HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
     DWORD pid = 0;
-    if (!root || (GetWindowThreadProcessId(root, &pid), pid) != GetCurrentProcessId()) return false;
-    try {
-        auto environment = xamlRoot.ContentIslandEnvironment();
-        if (!environment) return false;
-        auto id = environment.AppWindowId();
-        if ((HWND)(uintptr_t)id.Value != root) return false;
-    } catch (...) {
-    }
-    ScreenToClient(root, &pt);
-    double scale = xamlRoot.RasterizationScale();
-    double x = pt.x / scale, y = pt.y / scale;
-    auto o = el.TransformToVisual(nullptr).TransformPoint({0, 0});
-    return x >= o.X && y >= o.Y && x < o.X + el.ActualWidth() && y < o.Y + el.ActualHeight();
+    if (root) GetWindowThreadProcessId(root, &pid);
+    return pid != GetCurrentProcessId();  // our popups (menus, tooltips) count as still inside
 }
+
+// Pointer moves anywhere in the window (handled ones too): hover follows them, so a leave (or an
+// enter) the pill's own events missed, e.g. while Dia moved its controls in, is caught on the next move.
+static void TrackArcPointer(const mux::FrameworkElement& el);
 
 // ☆ / ⋯ fade in while the pointer is over the pill and out when it leaves (Arc's clean pill).
 static void UpdateArcTrailing(ArcState& st, bool animate) {
@@ -4094,6 +4094,50 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
         fade.InsertKeyFrame(1.0f, show ? 1.0f : 0.0f);
         fade.Duration(std::chrono::milliseconds(show ? 120 : 180));
         v.StartAnimation(L"Opacity", fade);
+    } catch (...) {
+    }
+}
+
+// ☆ / ⋯ flush with the pill: Dia lays them out for its toolbar, which leaves ⋯ off-center in the pill
+// (touching the bottom, a gap above and a wider one on the right). Move the pair so ⋯ keeps the same
+// small inset from the top, bottom and right edges, with corners that follow the pill's.
+static void FlushArcTrailing(ArcState& st) {
+    auto url = st.url.get().try_as<mux::FrameworkElement>();
+    auto host = url ? FindByName(url, L"AssistantBarHost") : nullptr;
+    auto trailing = host ? FindByName(host, L"UrlBarTrailingStack").try_as<muxc::Panel>() : nullptr;
+    if (!trailing || url.ActualHeight() <= 0) return;
+    muxc::Button last{nullptr};
+    std::vector<muxc::Button> buttons;
+    for (auto const& c : trailing.Children())
+        if (auto b = c.try_as<muxc::Button>(); b && b.Visibility() == mux::Visibility::Visible && b.ActualWidth() > 0)
+            buttons.push_back(b), last = b;
+    if (!last) return;
+    if (st.flushed.get() != trailing) {
+        if (auto old = st.flushed.get()) old.RenderTransform(st.flushedTransform);
+        st.flushed = winrt::make_weak(trailing.as<mux::UIElement>());
+        st.flushedTransform = trailing.RenderTransform();
+    }
+    auto shift = trailing.RenderTransform().try_as<muxm::TranslateTransform>();
+    if (!shift || shift == st.flushedTransform) shift = muxm::TranslateTransform{}, trailing.RenderTransform(shift);
+    try {
+        auto bg = FindByName(last, L"BackgroundBorder");
+        mux::FrameworkElement box = bg && bg.ActualHeight() > 0 ? bg : last.as<mux::FrameworkElement>();
+        auto r = box.TransformToVisual(url).TransformBounds({0, 0, (float)box.ActualWidth(), (float)box.ActualHeight()});
+        double inset = (std::max)(0.0, (url.ActualHeight() - r.Height) / 2);
+        double dx = (url.ActualWidth() - inset) - (r.X + r.Width), dy = inset - r.Y;
+        if (std::abs(dx) > 0.25) shift.X(shift.X() + dx);
+        if (std::abs(dy) > 0.25) shift.Y(shift.Y() + dy);
+        // Concentric corners: the pill's radius less the gap.
+        double radius = (std::max)(4.0, url.as<muxc::Grid>().CornerRadius().TopRight - inset);
+        for (auto& b : buttons)
+            if (std::abs(b.CornerRadius().TopRight - radius) > 0.1) {
+                bool known = false;
+                for (auto& [w, dp, v] : st.iconTint)
+                    if (dp == muxc::Control::CornerRadiusProperty() && w.get() == b) known = true;
+                if (!known) st.iconTint.push_back({winrt::make_weak(b.as<mux::DependencyObject>()), muxc::Control::CornerRadiusProperty(),
+                                                   b.ReadLocalValue(muxc::Control::CornerRadiusProperty())});
+                b.CornerRadius({radius, radius, radius, radius});
+            }
     } catch (...) {
     }
 }
@@ -4853,8 +4897,12 @@ static void UpdateArcBar() {
             BuildArcRows(st, paging);
         }
         AdoptActiveTab(st);
-        if (auto u = st.url.get().try_as<mux::FrameworkElement>()) st.hover = PointerInside(u);  // events can miss a leave
+        if (auto u = st.url.get().try_as<mux::FrameworkElement>()) {
+            TrackArcPointer(u);
+            if (st.hover && PointerLeftWindow(u)) st.hover = false;  // events can miss a leave
+        }
         UpdateArcTrailing(st, !st.swapped);
+        FlushArcTrailing(st);
         UpdateArcLabel(st);
         ArcStyleHeader(st);
         if (st.swapped) st.swapped = false, UpdateAddressField();
@@ -5360,6 +5408,45 @@ static void HookArcWinHover(const mux::FrameworkElement& host) {
     host.PointerExited([update](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) { update(s, e, true); });
 }
 
+static bool InBounds(const mux::FrameworkElement& el, mux::Input::PointerRoutedEventArgs const& e) {
+    if (!el || el.Visibility() != mux::Visibility::Visible) return false;
+    auto p = e.GetCurrentPoint(el).Position();
+    return p.X >= 0 && p.Y >= 0 && p.X < el.ActualWidth() && p.Y < el.ActualHeight();
+}
+
+static void TrackArcPointer(const mux::FrameworkElement& el) {
+    static thread_local std::set<void*> hooked;
+    auto xr = el ? el.XamlRoot() : nullptr;
+    auto content = xr ? xr.Content() : nullptr;
+    if (!content || !hooked.insert(winrt::get_abi(content)).second) return;
+    content.AddHandler(
+        mux::UIElement::PointerMovedEvent(),
+        winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
+            auto root = sender.try_as<mux::UIElement>();
+            auto xr = root ? root.XamlRoot() : nullptr;
+            if (!xr) return;
+            try {
+                for (auto& [h, st] : t_arc) {
+                    auto u = st.url.get().try_as<mux::FrameworkElement>();
+                    if (!u || u.XamlRoot() != xr) continue;
+                    bool in = InBounds(u, e);
+                    if (in != st.hover) st.hover = in, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                }
+                for (auto& [h, x] : t_arcWin) {
+                    auto pill = x.pill.get();
+                    if (!pill || pill.XamlRoot() != xr) continue;
+                    bool in = InBounds(pill, e);
+                    if (in != x.hover) {
+                        x.hover = in;
+                        LayoutArcWinSafe([pill](const ArcWinBar& b) { return b.pill.get() == pill; });
+                    }
+                }
+            } catch (...) {
+            }
+        })),
+        true);
+}
+
 static bool NewTabRelayActive();
 
 // Tabs' own toolbars other than the one under the strip: Dia shows a new tab's toolbar the moment it
@@ -5438,7 +5525,11 @@ static void UpdateArcWindows() {
         }
         PlaceArcWinStrip(b);
         auto host = FindByName(bar, L"AssistantBarHost");
-        if (b.hover && !(b.pill.get() && PointerInside(b.pill.get()))) b.hover = false;  // events can miss a leave
+        if (auto pill = b.pill.get()) {
+            TrackArcPointer(pill);
+            if (b.hover && PointerLeftWindow(pill)) b.hover = false;  // events can miss a leave
+        } else
+            b.hover = false;
         LayoutArcWin(b);
     }
     for (auto it = t_arcWin.begin(); it != t_arcWin.end();)

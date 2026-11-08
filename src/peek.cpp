@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "llhook.h"
 
 #define Log Engine_Log
 
@@ -147,9 +148,11 @@ HWND g_holdWidget = nullptr;
 std::wstring g_holdUrl;  // the link held on
 std::atomic<bool> g_shift{false}, g_ctrl{false}, g_alt{false}, g_win{false};
 
-DWORD g_thread = 0;  // the UI thread that owns the hooks and the preview
+DWORD g_thread = 0;  // the UI thread that owns the preview (and its thread hooks)
 HWND g_msg = nullptr;
-HHOOK g_mouse = nullptr, g_keys = nullptr, g_cbt = nullptr, g_after = nullptr, g_before = nullptr;
+// The mouse and key hooks, on a thread of their own (see llhook.h): set only while Peek is on.
+LowLevelHookThread g_inputHooks;
+HHOOK g_cbt = nullptr, g_after = nullptr, g_before = nullptr;
 bool g_dragging = false;  // a drag is sizing or moving the preview's window (see BeforeHook)
 HWINEVENTHOOK g_showHook = nullptr;
 std::atomic<bool> g_on{false};
@@ -159,6 +162,16 @@ HWND g_clickWidget = nullptr;
 std::atomic<ULONGLONG> g_lastMove{0};  // when the pointer last moved
 
 Peek* g_peek = nullptr;
+// What the input hooks need of g_peek, which only the UI thread may read: set by Publish.
+std::atomic<bool> g_hasPeek{false}, g_peekWarm{false};
+std::atomic<int> g_peekPhase{0}, g_peekInject{0};
+void Publish() {
+    Peek* p = g_peek;
+    g_peekWarm = p && p->warm;
+    g_peekPhase = p ? (int)p->phase : 0;
+    g_peekInject = p ? p->injectStep : 0;
+    g_hasPeek = p != nullptr;
+}
 // Where the page sat in the last Dia window shown: from its left and top edges, and how much smaller than
 // the window it was. A new window is made that much bigger than the card, so its page lands on the card at
 // once (no second layout).
@@ -2696,8 +2709,9 @@ void DiaTick() {
         if (age > kRetryMs && !p->retried && p->injectStep == 3) {  // (once more: Dia missed the first)
             p->retried = true;
             Log("peek: no window yet, clicking the link again");
-            SendShift(true);
             p->injectStep = 1;
+            Publish();
+            SendShift(true);
             p->started = GetTickCount64() - kRetryMs;  // (the time left counts from here)
             SetTimer(g_msg, kTimerInject, 25, nullptr);
             return;
@@ -2836,12 +2850,14 @@ void InjectStep() {
         return;
     }
     if (p->injectStep == 1) {
-        ClickAt(p->origin);
         p->injectStep = 2;
+        Publish();
+        ClickAt(p->origin);
         return;
     }
     SendShift(false);
     p->injectStep = 3;
+    Publish();
     KillTimer(g_msg, kTimerInject);
     if (!p->warm && !p->backdrop) StartCard(p);  // (once: a retry clicks again, the card's out already)
 }
@@ -2878,6 +2894,7 @@ bool Open(HWND widget, POINT click, const std::wstring& url, bool warm = false) 
     p->url = url;
     p->warm = warm;
     g_peek = p;
+    Publish();
     p->started = GetTickCount64();
     // Dia opens the link: Shift+click, the press and release at the link (the page never saw the real
     // press). The modifier-click triggers keep their keys down: those are released first.
@@ -2888,8 +2905,9 @@ bool Open(HWND widget, POINT click, const std::wstring& url, bool warm = false) 
         if (g_alt) up[n].type = INPUT_KEYBOARD, up[n].ki.wVk = VK_MENU, up[n++].ki.dwFlags = KEYEVENTF_KEYUP;
         if (n) SendInput(n, up, sizeof(INPUT));
     }
+    p->injectStep = 1;  // (before the Shift goes down: the key hook keeps your Shift held from here)
+    Publish();
     SendShift(true);
-    p->injectStep = 1;
     SetTimer(g_msg, kTimerInject, 25, nullptr);
     SetTimer(g_msg, kTimerDia, 15, nullptr);
     Log("peek: opening %ls", HostOf(url).c_str());
@@ -3090,6 +3108,7 @@ LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
     } catch (...) {
     }
+    Publish();  // (whatever the message changed, for the input hooks)
     return DefWindowProcW(h, msg, wp, lp);
 }
 
@@ -3102,7 +3121,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
         if (g_trigger == kHold && !ours) {
             int st = g_hold;
             if (wp == WM_LBUTTONDOWN) {
-                if (st == kIdle && !g_peek && !g_shift && !g_ctrl && !g_alt && !g_win && DiaIsForeground()) {
+                if (st == kIdle && !g_hasPeek && !g_shift && !g_ctrl && !g_alt && !g_win && DiaIsForeground()) {
                     if (HWND w = PageWidgetAt(m->pt)) {
                         g_holdPt = m->pt;
                         g_holdWidget = w;
@@ -3125,7 +3144,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                     PostMessageW(g_msg, WM_PEEK_REPLAY, 0, 0);
             }
         } else if (g_trigger == kShift && wp == WM_MOUSEMOVE && !ours && g_shift && !g_ctrl && !g_alt && !g_win &&
-                   (!g_peek || g_peek->warm)) {
+                   (!g_hasPeek || g_peekWarm)) {
             static ULONGLONG last = 0;  // (a look at the link under the pointer, at most every 80 ms)
             ULONGLONG now = GetTickCount64();
             if (now - last >= 100) {
@@ -3133,7 +3152,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                 PostMessageW(g_msg, WM_PEEK_WARM, 0, 0);
             }
         }
-        if (g_trigger != kHold && wp == WM_LBUTTONDOWN && !ours && (!g_peek || g_peek->warm)) {
+        if (g_trigger != kHold && wp == WM_LBUTTONDOWN && !ours && (!g_hasPeek || g_peekWarm)) {
             bool shift = g_shift, ctrl = g_ctrl, alt = g_alt;
             int t = g_trigger;
             bool match = !g_win && (t == kShift      ? shift && !ctrl && !alt
@@ -3171,23 +3190,23 @@ LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
                                                                                               : nullptr;
         // Shift let go while Peek clicks the link for Dia (a quick Shift+click): Dia would get a plain click
         // and open the link in your tab. Ours lets go once the click is in (InjectStep).
-        if (mod == &g_shift && !down && k->dwExtraInfo != kReplayTag && g_peek && g_peek->phase == kLoading &&
-            (g_peek->injectStep == 1 || g_peek->injectStep == 2)) {
+        if (mod == &g_shift && !down && k->dwExtraInfo != kReplayTag && g_hasPeek && g_peekPhase == kLoading &&
+            (g_peekInject == 1 || g_peekInject == 2)) {
             g_shift = false;
             return 1;
         }
-        if (mod && !(injected && (g_peek || k->dwExtraInfo == kReplayTag))) {  // (our own Shift isn't you)
+        if (mod && !(injected && (g_hasPeek || k->dwExtraInfo == kReplayTag))) {  // (our own Shift isn't you)
             bool was = *mod;
             *mod = down;
             if (mod == &g_shift && g_on && g_trigger == kShift && was != down && !injected) {
                 if (down && !g_ctrl && !g_alt && !g_win) PostMessageW(g_msg, WM_PEEK_WARM, 0, 0);
                 else if (!down) PostMessageW(g_msg, WM_PEEK_COOL, 0, 0);
             }
-        } else if (g_on && down && vk == VK_ESCAPE && g_peek && DiaIsForeground()) {
+        } else if (g_on && down && vk == VK_ESCAPE && g_hasPeek && DiaIsForeground()) {
             PostMessageW(g_msg, WM_PEEK_ESC, 0, 0);
             return 1;
-        } else if (g_on && down && (vk == 'W' || vk == 'O') && g_ctrl && !g_shift && !g_alt && g_peek &&
-                   g_peek->phase == kOpen && DiaIsForeground()) {  // DiaTweaks' Close Ctrl+W, Expand Ctrl+O
+        } else if (g_on && down && (vk == 'W' || vk == 'O') && g_ctrl && !g_shift && !g_alt && g_hasPeek &&
+                   g_peekPhase == kOpen && DiaIsForeground()) {  // DiaTweaks' Close Ctrl+W, Expand Ctrl+O
             PostMessageW(g_msg, WM_PEEK_ESC, vk == 'O', 0);
             return 1;
         }
@@ -3203,13 +3222,25 @@ void Install() {
     wc.lpszClassName = L"DiaTweaksPeekMsg";
     RegisterClassW(&wc);
     g_msg = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&MouseHook, &self);
-    g_mouse = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, self, 0);
-    g_keys = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, self, 0);
-    if (!g_mouse || !g_keys) Log("peek: hook failed %lu", GetLastError());
-    else Log("peek: ready on thread %lu", g_thread);
+    Log("peek: ready on thread %lu", g_thread);
+}
+
+// The mouse and key hooks: on while Peek is on, off (no cost to your input) while it's off.
+void SetInputHooks(bool on) {
+    static bool failed = false;  // (not tried again every tick: once more after Peek is turned off and on)
+    if (!on) failed = false;
+    if (on == g_inputHooks.Running() || (on && failed)) return;
+    if (!on) {
+        g_inputHooks.Stop();
+        g_hold = kIdle;
+        g_swallowUp = false;
+        Log("peek: input hooks off");
+    } else if (g_inputHooks.Start(MouseHook, KeyHook)) {
+        Log("peek: input hooks on");
+    } else {
+        failed = true;
+        Log("peek: hook failed %lu", g_inputHooks.Error());
+    }
 }
 
 }  // namespace
@@ -3238,7 +3269,11 @@ void Peek_Tick() {
     if (GetCurrentThreadId() != g_thread) return;
     if (!on) {
         if (g_peek) Destroy();
+        Publish();
+        SetInputHooks(false);
         return;
     }
+    SetInputHooks(true);
     Follow();
+    Publish();
 }

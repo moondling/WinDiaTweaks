@@ -17,7 +17,7 @@ Every tweak targets a single detail of Dia's interface: the margin around web pa
 At the top of **Patches**, **Preset** sets everything at once:
 
 - **None**: Dia as it comes (the default).
-- **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic.
+- **Arc**: the address bar and buttons move into the sidebar, the toolbar hides, pages go edge to edge with square corners, Ctrl+T opens a floating bar, tab hover cards stop popping up, the window turns acrylic, and a media card shows what plays in other tabs.
 - **Arc (Windows)**: like Arc for Windows. The toolbar stays, in the sidebar's color, with just the site centered in it; otherwise the same as Arc.
 - **Custom**: your own mix. Changing any tweak switches to it.
 
@@ -51,6 +51,8 @@ At the top of **Patches**, **Preset** sets everything at once:
 | Translucent sidebar | Lets the page show through the sidebar when it floats over the page |
 | **Tidy Tabs** | |
 | Tidy Tabs ✨ | A line at the top of your tabs with **Tidy** (a broom) and **Clear**, as in DiaTweaks on macOS and Arc. Tidy asks Dia's chat, out of sight and without its chime, to group your open tabs by topic; Dia makes, names and colors the groups while the line rolls as a wave. Clear does Dia's own Close All Tabs (as from a right-click on the sidebar) in one click. With tabs on top, the two show as icons at the right end of the tab bar. Options: show it always or on hover, icons only or with text, Tidy and Clear, Tidy only or Clear only |
+| **Media Controls** | |
+| Media Controls | When a tab you've switched away from plays, a card at the bottom of the sidebar shows its artwork, title and artist, with an equalizer in your profile's color that follows the sound. Hovering opens it into a small player: a progress bar you can click or drag to seek, the time played and left, go to the tab, previous, play/pause, next, mute and ✕. Clicking the card goes back to the tab. Songs change smoothly (the artwork turns over, the title rolls). Option: wait while the video is in picture in picture |
 | **Window** | |
 | Hide window buttons | Hides minimize, maximize and close (Alt+F4 still closes) |
 | Window material | Mica, Mica Alt or Acrylic behind the tabs and sidebar |

@@ -17,6 +17,7 @@ Thanks for helping out. The short version: small changes, checked by hand in Dia
 | `tweaks.conf` | Every tweak: title, description, section, icon, option, and its property rules |
 | `src/tap.cpp` | The engine inside Dia: tracks Dia's UI tree, applies the rules, puts Dia's values back |
 | `src/ui.cpp` | Settings → Patches, and the tweaks that need real code (Arc URL bar, toolbar slide, ...) |
+| `src/media.cpp` | Media Controls: the card at the bottom of the sidebar, its player, and the equalizer |
 | `src/diatweaks.cpp` | The `diatweaks` command: opens Dia, loads the add-on, edits `tweaks.conf` |
 | `src/engine.h` | What `tap.cpp` and `ui.cpp` share |
 | `gen-winrt.cmd` | Makes C++/WinRT headers from the WinUI metadata in your Dia install (or NuGet without Dia) |

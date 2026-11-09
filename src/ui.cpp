@@ -311,6 +311,11 @@ static void RunProbe() {
             o << Tidy_DebugSend(nm == L"TIDYPOST") << "\n";
             continue;
         }
+        if (nm == L"COLORS") {  // colorful brushes in use, and where (finding Dia's profile color)
+            extern std::string Media_DebugColors();
+            o << Media_DebugColors();
+            continue;
+        }
         if (nm == L"FLYOUTS") {  // elements with a right-click menu, and what's in them
             extern std::string Tidy_DebugFlyouts();
             o << Tidy_DebugFlyouts();
@@ -676,17 +681,17 @@ static void ApplyPreset(const std::wstring& preset) {
     std::vector<std::pair<std::wstring, std::wstring>> values{{L"preset", preset}};
     if (preset == L"custom") return Engine_SetMany({}, values);  // keep the patches as they are
     // Arc: the page fills the window with straight edges, the toolbar lives in the sidebar, Ctrl+T
-    // floats, no tab hover cards, an acrylic window, and Peek.
+    // floats, no tab hover cards, an acrylic window, Peek, and media controls at the bottom of the sidebar.
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
-                                               L"peek",           L"tidyTabs"};
+                                               L"peek",           L"tidyTabs",            L"mediaControls"};
     // Arc (Windows): the same, but like Arc for Windows the toolbar stays, in the sidebar's color, with
     // the site centered in it (the Centered address bar).
     static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",
                                                       L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
                                                       L"hideTabHoverCard", L"windowMaterial",   L"peek",
-                                                      L"tidyTabs"};
+                                                      L"tidyTabs",         L"mediaControls"};
     bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
@@ -6371,6 +6376,8 @@ static HWND TopWindowFor(const mux::XamlRoot& root) {
     return ctx.best;
 }
 
+HWND Ui_TopWindowFor(const mux::XamlRoot& root) { return TopWindowFor(root); }  // (media.cpp)
+
 // The strip's empty space, in window pixels: the strip minus its left buttons, the centered group and
 // its right buttons. That's what drags the window, as in Arc's title bar.
 static std::vector<winrt::Windows::Graphics::RectInt32> ArcWinDragRects(const mux::XamlRoot& root) {
@@ -6600,6 +6607,8 @@ bool Ui_Tick() {
         UpdateCleanSearchBox();
         History_Tick();
         UpdateTidyTabs();
+        stage = "media";
+        Media_Tick();
         if (tick % 3 == 0) {
             stage = "look";
             UpdateWindowMaterial();

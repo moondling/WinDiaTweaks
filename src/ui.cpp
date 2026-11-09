@@ -6660,16 +6660,27 @@ static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
     return nullptr;
 }
 
+static mux::FrameworkElement PeekTabLabelExact(const mux::FrameworkElement& list, HWND window);
+
+// The window's tab list. A window can hold more than one (one left over from its first layout, still
+// showing "New Tab"): the one whose tab is the window's page is preferred, then one that's shown.
 static mux::FrameworkElement PeekTabList(HWND window) {
+    std::vector<mux::FrameworkElement> lists;
     for (auto h : FindNodes(L"TabListPresenter")) {
         auto list = Obj<mux::FrameworkElement>(h);
         auto root = list ? list.XamlRoot() : nullptr;
         if (!root) continue;
         auto env = root.ContentIslandEnvironment();
         HWND top = env ? GetAncestor((HWND)(uintptr_t)env.AppWindowId().Value, GA_ROOT) : nullptr;
-        if ((top ? top : TopWindowFor(root)) == window) return list;
+        if ((top ? top : TopWindowFor(root)) == window) lists.push_back(list);
     }
-    return nullptr;
+    if (lists.size() > 1) {
+        for (auto& l : lists)
+            if (PeekTabLabelExact(l, window)) return l;
+        for (auto& l : lists)
+            if (l.ActualWidth() > 1 && l.ActualHeight() > 1 && l.Visibility() == mux::Visibility::Visible) return l;
+    }
+    return lists.empty() ? nullptr : lists.front();
 }
 
 // Dia's menu labels, compared ignoring case: Dia 1.6 writes "Move to window" and "New window" where 1.5
@@ -6681,7 +6692,20 @@ static bool EndsWithNoCase(std::wstring_view s, std::wstring_view suffix) {
     return s.size() >= suffix.size() && _wcsnicmp(s.data() + s.size() - suffix.size(), suffix.data(), suffix.size()) == 0;
 }
 
-static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
+// Is this tab label the tab a window title names? Either may be cut short (one starts the other). With
+// more than one profile, Dia puts the profile's name before the page's in the window title ("Work: Apps |
+// Dia Browser" for the tab "Apps | Dia Browser"), so the title is also tried without it.
+static bool TabLabelMatches(const std::wstring& label, const std::wstring& title) {
+    if (label.empty() || label == L"New Tab" || title.empty()) return false;
+    if (label.starts_with(title) || title.starts_with(label)) return true;
+    size_t colon = title.find(L": ");
+    if (colon == std::wstring::npos) return false;
+    std::wstring page = title.substr(colon + 2);
+    return !page.empty() && (label.starts_with(page) || page.starts_with(label));
+}
+
+// The tab whose label is the window's title (its page), if the list shows it.
+static mux::FrameworkElement PeekTabLabelExact(const mux::FrameworkElement& list, HWND window) {
     wchar_t title[512]{};
     GetWindowTextW(window, title, ARRAYSIZE(title));
     auto untrimmed = [](std::wstring text) {
@@ -6694,9 +6718,31 @@ static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWN
     return FirstIn(list, [&](const mux::FrameworkElement& fe) {
         auto text = fe.try_as<muxc::TextBlock>();
         if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
-        std::wstring label = untrimmed(std::wstring(text.Text()));
-        return !label.empty() && label != L"New Tab" &&
-               (label.starts_with(name) || name.starts_with(label));
+        return TabLabelMatches(untrimmed(std::wstring(text.Text())), name);
+    });
+}
+
+static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
+    wchar_t title[512]{};
+    GetWindowTextW(window, title, ARRAYSIZE(title));
+    auto untrimmed = [](std::wstring text) {
+        if (text.ends_with(L"…")) text.pop_back();
+        else if (text.ends_with(L"...")) text.resize(text.size() - 3);
+        return text;
+    };
+    std::wstring name = untrimmed(title);
+    if (name.empty()) return nullptr;
+    auto match = FirstIn(list, [&](const mux::FrameworkElement& fe) {
+        auto text = fe.try_as<muxc::TextBlock>();
+        if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
+        return TabLabelMatches(untrimmed(std::wstring(text.Text())), name);
+    });
+    if (match) return match;
+    // The preview's window holds one tab, whose label can lag its title (still "New Tab" a while after
+    // the page has its own): its first label, then.
+    return FirstIn(list, [&](const mux::FrameworkElement& fe) {
+        auto text = fe.try_as<muxc::TextBlock>();
+        return text && fe.ActualWidth() > 1 && fe.ActualHeight() > 1 && !text.Text().empty();
     });
 }
 
@@ -6705,18 +6751,74 @@ bool Ui_PeekTabRow(HWND win, RECT& out) {
         auto list = PeekTabList(win);
         auto label = list ? PeekTabLabel(list, win) : nullptr;
         if (!label) return false;
-        double scale = label.XamlRoot().RasterizationScale();
-        auto o = label.TransformToVisual(nullptr).TransformPoint({0, 0});
+        // (laid out now: a window kept off the screen can be a frame or more behind its new size)
+        if (auto content = list.XamlRoot().Content()) content.UpdateLayout();
+        // The tab's whole row (the widest element around its label, no taller than a row), not only its
+        // text: a short title leaves little of the row to click.
+        auto row = label;
+        for (auto e = label; e && e != list; e = muxm::VisualTreeHelper::GetParent(e).try_as<mux::FrameworkElement>()) {
+            if (e.Name() == L"RowsPanel") break;
+            if (e.ActualHeight() <= label.ActualHeight() * 3 && e.ActualWidth() > row.ActualWidth()) row = e;
+        }
+        double scale = row.XamlRoot().RasterizationScale();
+        auto o = row.TransformToVisual(nullptr).TransformPoint({0, 0});
         POINT origin{};
         if (!ClientToScreen(win, &origin)) return false;
         out.left = origin.x + (LONG)std::lround(o.X * scale);
         out.top = origin.y + (LONG)std::lround(o.Y * scale);
-        out.right = out.left + (LONG)std::lround(label.ActualWidth() * scale);
-        out.bottom = out.top + (LONG)std::lround(label.ActualHeight() * scale);
+        out.right = out.left + (LONG)std::lround(row.ActualWidth() * scale);
+        out.bottom = out.top + (LONG)std::lround(row.ActualHeight() * scale);
         return !IsRectEmpty(&out);
     } catch (...) {
         return false;
     }
+}
+
+std::wstring Ui_PeekTabInfo(HWND win) {
+    std::wstring out;
+    try {
+        wchar_t title[256]{};
+        GetWindowTextW(win, title, ARRAYSIZE(title));
+        out = L"title '" + std::wstring(title) + L"'";
+        auto list = PeekTabList(win);
+        if (!list) return out + L", no tab list";
+        out += L", labels:";
+        int n = 0;
+        FirstIn(list, [&](const mux::FrameworkElement& fe) {
+            if (auto text = fe.try_as<muxc::TextBlock>(); text && !text.Text().empty()) {
+                out += L" '" + std::wstring(text.Text()) + (fe.ActualWidth() <= 1 ? L"' (hidden)" : L"'");
+                ++n;
+            }
+            return n >= 12;
+        });
+    } catch (...) {
+    }
+    return out;
+}
+
+std::wstring Ui_PeekMenuInfo(HWND win) {
+    std::wstring out;
+    try {
+        auto list = PeekTabList(win);
+        if (!list) return L"no tab list";
+        auto pops = muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot());
+        out = std::to_wstring(pops.Size()) + L" popups open";
+        int n = 0;
+        for (auto const& pop : pops) {
+            auto child = pop.Child();
+            if (!child) continue;
+            FirstIn(child, [&](const mux::FrameworkElement& fe) {
+                if (auto sub = fe.try_as<muxc::MenuFlyoutSubItem>()) out += L" [" + std::wstring(sub.Text()) + L" >]", ++n;
+                else if (auto item = fe.try_as<muxc::MenuFlyoutItem>()) out += L" [" + std::wstring(item.Text()) + L"]", ++n;
+                return n >= 20;
+            });
+        }
+        wchar_t fg[128]{};
+        GetWindowTextW(GetForegroundWindow(), fg, ARRAYSIZE(fg));
+        out += L"; in front: '" + std::wstring(fg) + (GetForegroundWindow() == win ? L"' (the preview)" : L"'");
+    } catch (...) {
+    }
+    return out;
 }
 
 bool Ui_PeekShowTabMenu(HWND window) {
@@ -6733,6 +6835,15 @@ bool Ui_PeekShowTabMenu(HWND window) {
     } catch (...) {
     }
     return false;
+}
+
+bool Ui_PeekMenuOpen(HWND win) {
+    try {
+        auto list = PeekTabList(win);
+        return list && muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot()).Size() > 0;
+    } catch (...) {
+        return false;
+    }
 }
 
 void Ui_PeekCloseTabMenu(HWND window) {
@@ -6792,8 +6903,7 @@ bool Ui_PeekTabRowNamed(HWND win, const std::wstring& title, RECT& out) {
         auto label = FirstIn(list, [&](const mux::FrameworkElement& fe) {
             auto text = fe.try_as<muxc::TextBlock>();
             if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
-            std::wstring l = untrimmed(std::wstring(text.Text()));
-            return !l.empty() && l != L"New Tab" && (l.starts_with(name) || name.starts_with(l));
+            return TabLabelMatches(untrimmed(std::wstring(text.Text())), name);
         });
         if (!label) return false;
         double scale = label.XamlRoot().RasterizationScale();

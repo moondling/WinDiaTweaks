@@ -5631,11 +5631,16 @@ static bool InNewTabMode() { return t_newTabMode; }
 static std::atomic<bool> g_arcPassCtrlT{false};     // let our own Ctrl+T through to Dia once
 static std::atomic<bool> g_arcEnterSubmits{false};  // new-tab mode, its box focused: Enter opens a new tab
 static thread_local std::wstring t_pendingQuery;  // text to submit in the new tab
-static thread_local int t_submitFrames = 0;
 static thread_local winrt::event_token t_submitToken{};
-static thread_local int t_enterIn = -1;  // frames until Enter, after the text was typed
+// The relay's steps, timed in ms (not frames: a frame is 4 ms on a 240 Hz screen and 17 ms on 60 Hz,
+// and none are drawn while Dia is busy).
+enum class Relay { WaitBox, WaitText, Verify };
+static thread_local Relay t_relayStep = Relay::WaitBox;
+static thread_local double t_relayDeadline = 0;  // give up after this
+static thread_local double t_relayAt = 0;        // when the text showed up / Enter was last pressed
+static thread_local int t_enterTries = 0;
 static thread_local std::wstring t_typedQuery;  // what we typed, to know when Dia has it
-static thread_local int t_settle = -1;          // frames to wait once Dia has the text
+static thread_local winrt::weak_ref<muxc::RichEditBox> t_relayBox;  // the new tab's box we typed into
 static thread_local winrt::weak_ref<mux::UIElement> t_hiddenPage;  // the New Tab page, hidden during the relay
 static thread_local int t_unhideFrames = 0;
 static thread_local winrt::event_token t_unhideToken{};
@@ -5757,69 +5762,94 @@ static void OpenTextInNewTab(const std::wstring& text) {
     if (ctrlHeld) SendKeys({{'T', true}, {'T', false}});
     else SendKeys({{VK_CONTROL, true}, {'T', true}, {'T', false}, {VK_CONTROL, false}});
     // Wait for the new tab's box to take focus, then fill it and press Enter.
-    t_submitFrames = 180;
+    t_relayStep = Relay::WaitBox;
+    t_relayDeadline = NowMs() + 3000;
     if (t_submitToken) return;
     t_submitToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
-        bool done = --t_submitFrames <= 0;
-        if (t_enterIn > 0) {
-            // Enter only works once Dia's own query has the text (it reads it a moment after the box
-            // shows it): wait for the box to hold exactly what we typed, then a few frames more.
-            if (t_settle < 0) {
-                if (auto box = FocusedNewTabBox()) {
-                    winrt::hstring raw;
-                    box.Document().GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, raw);
-                    std::wstring cur(raw);
-                    while (!cur.empty() && iswspace(cur.back())) cur.pop_back();
-                    if (cur.rfind(t_typedQuery, 0) == 0) t_settle = 8;  // (Dia may add autocomplete after it)
+        double now = NowMs();
+        bool done = now >= t_relayDeadline;
+        // The box still holds what we typed (Dia may add autocomplete after it).
+        auto holdsText = [](const muxc::RichEditBox& box) {
+            winrt::hstring raw;
+            box.Document().GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, raw);
+            std::wstring cur(raw);
+            while (!cur.empty() && iswspace(cur.back())) cur.pop_back();
+            return !t_typedQuery.empty() && cur.rfind(t_typedQuery, 0) == 0;
+        };
+        if (t_relayStep == Relay::WaitBox) {
+            if (auto box = FocusedNewTabBox(); box && !t_pendingQuery.empty()) {
+                // Hide the New Tab page while this runs: you see the new tab go straight to the URL.
+                for (mux::DependencyObject d = box; d; d = muxm::VisualTreeHelper::GetParent(d))
+                    if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"VariantHost") {
+                        fe.Opacity(0);
+                        t_hiddenPage = winrt::make_weak(fe.as<mux::UIElement>());
+                        break;
+                    }
+                // Type it as real input so Dia's own query logic sees it (setting the text directly doesn't).
+                std::vector<INPUT> in;
+                if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // Ctrl still held from Ctrl+T would turn letters into shortcuts
+                    INPUT up{};
+                    up.type = INPUT_KEYBOARD;
+                    up.ki.wVk = VK_CONTROL;
+                    up.ki.dwFlags = KEYEVENTF_KEYUP;
+                    in.push_back(up);
                 }
+                for (wchar_t ch : t_pendingQuery) {
+                    INPUT d{};
+                    d.type = INPUT_KEYBOARD;
+                    d.ki.wScan = ch;
+                    d.ki.dwFlags = KEYEVENTF_UNICODE;
+                    INPUT u = d;
+                    u.ki.dwFlags |= KEYEVENTF_KEYUP;
+                    in.push_back(d);
+                    in.push_back(u);
+                }
+                SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
+                t_typedQuery = t_pendingQuery;
+                t_pendingQuery.clear();
+                t_relayBox = winrt::make_weak(box);
+                t_relayStep = Relay::WaitText;
+                t_relayAt = 0;
+                t_enterTries = 0;
+                // Long text takes Dia a while to take in, one key at a time.
+                t_relayDeadline = now + 3000 + 5.0 * t_typedQuery.size();
+                done = false;
             }
-            bool fire = (t_settle >= 0 && --t_settle < 0) || --t_enterIn == 0;
-            if (fire) {
+        } else if (t_relayStep == Relay::WaitText) {
+            // Enter only works once Dia's own query has the text, a moment after the box shows it: wait
+            // for the box to hold what we typed, then a little more.
+            auto box = t_relayBox.get();
+            if (box && t_relayAt == 0 && holdsText(box)) t_relayAt = now;
+            if ((t_relayAt != 0 && now - t_relayAt >= 120) || (done && box)) {
                 SendKeys({{VK_RETURN, true}, {VK_RETURN, false}});  // open it
-                UnhidePageLater();
+                t_enterTries = 1;
+                t_relayAt = now;
+                t_relayStep = Relay::Verify;
+                t_relayDeadline = now + 2500;
+                done = false;
+            }
+        } else {  // Relay::Verify
+            // Dia can still drop that Enter (its query not ready yet). The box keeping focus and our text
+            // means the tab didn't go anywhere: press Enter again, a few times at most.
+            auto box = t_relayBox.get();
+            bool stuck = box && box == FocusedNewTabBox() && holdsText(box);
+            if (!stuck) {
                 done = true;
+            } else if (now - t_relayAt >= 350 && t_enterTries < 4) {
+                SendKeys({{VK_RETURN, true}, {VK_RETURN, false}});
+                t_enterTries++;
+                t_relayAt = now;
+            } else if (done) {
             }
-        } else if (auto box = FocusedNewTabBox(); box && !t_pendingQuery.empty()) {
-            // Hide the New Tab page while this runs: you see the new tab go straight to the URL.
-            for (mux::DependencyObject d = box; d; d = muxm::VisualTreeHelper::GetParent(d))
-                if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"VariantHost") {
-                    fe.Opacity(0);
-                    t_hiddenPage = winrt::make_weak(fe.as<mux::UIElement>());
-                    break;
-                }
-            // Type it as real input so Dia's own query logic sees it (setting the text directly doesn't).
-            std::vector<INPUT> in;
-            if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // Ctrl still held from Ctrl+T would turn letters into shortcuts
-                INPUT up{};
-                up.type = INPUT_KEYBOARD;
-                up.ki.wVk = VK_CONTROL;
-                up.ki.dwFlags = KEYEVENTF_KEYUP;
-                in.push_back(up);
-            }
-            for (wchar_t ch : t_pendingQuery) {
-                INPUT d{};
-                d.type = INPUT_KEYBOARD;
-                d.ki.wScan = ch;
-                d.ki.dwFlags = KEYEVENTF_UNICODE;
-                INPUT u = d;
-                u.ki.dwFlags |= KEYEVENTF_KEYUP;
-                in.push_back(d);
-                in.push_back(u);
-            }
-            SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
-            t_typedQuery = t_pendingQuery;
-            t_pendingQuery.clear();
-            t_settle = -1;
-            t_enterIn = 120;  // until Dia has the text (see above), at most ~2 s
-            t_submitFrames = (std::max)(t_submitFrames, 120);
         }
         if (done) {
             muxm::CompositionTarget::Rendering(t_submitToken);
             t_submitToken = {};
             t_pendingQuery.clear();
+            t_typedQuery.clear();
+            t_relayBox = nullptr;
             g_arcPassCtrlT = false;
-            t_enterIn = -1;
-            if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // gave up: never leave it hidden
+            if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // never leave it hidden
             if (!t_hiddenPage.get() && !t_unhideToken) t_relayText.clear(), ScheduleArcAdopt();
         }
     });

@@ -51,6 +51,7 @@
 #include <vector>
 
 #include "engine.h"
+#include "llhook.h"
 
 #define Log Engine_Log
 
@@ -147,9 +148,11 @@ HWND g_holdWidget = nullptr;
 std::wstring g_holdUrl;  // the link held on
 std::atomic<bool> g_shift{false}, g_ctrl{false}, g_alt{false}, g_win{false};
 
-DWORD g_thread = 0;  // the UI thread that owns the hooks and the preview
+DWORD g_thread = 0;  // the UI thread that owns the preview (and its thread hooks)
 HWND g_msg = nullptr;
-HHOOK g_mouse = nullptr, g_keys = nullptr, g_cbt = nullptr, g_after = nullptr, g_before = nullptr;
+// The mouse and key hooks, on a thread of their own (see llhook.h): set only while Peek is on.
+LowLevelHookThread g_inputHooks;
+HHOOK g_cbt = nullptr, g_after = nullptr, g_before = nullptr;
 bool g_dragging = false;  // a drag is sizing or moving the preview's window (see BeforeHook)
 HWINEVENTHOOK g_showHook = nullptr;
 std::atomic<bool> g_on{false};
@@ -159,12 +162,29 @@ HWND g_clickWidget = nullptr;
 std::atomic<ULONGLONG> g_lastMove{0};  // when the pointer last moved
 
 Peek* g_peek = nullptr;
+// What the input hooks need of g_peek, which only the UI thread may read: set by Publish.
+std::atomic<bool> g_hasPeek{false}, g_peekWarm{false};
+std::atomic<int> g_peekPhase{0}, g_peekInject{0};
+void Publish() {
+    Peek* p = g_peek;
+    g_peekWarm = p && p->warm;
+    g_peekPhase = p ? (int)p->phase : 0;
+    g_peekInject = p ? p->injectStep : 0;
+    g_hasPeek = p != nullptr;
+}
 // Where the page sat in the last Dia window shown: from its left and top edges, and how much smaller than
 // the window it was. A new window is made that much bigger than the card, so its page lands on the card at
 // once (no second layout).
 struct { int dx = 0, dy = 0, dw = 0, dh = 0; } g_offset;
 
 // ---------------------------------------------------------------- helpers
+
+// For the log (%ls drops a whole line holding text that isn't ASCII).
+std::string U8(const std::wstring& s) {
+    std::string out((size_t)WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), nullptr, 0, nullptr, nullptr), ' ');
+    WideCharToMultiByte(CP_UTF8, 0, s.c_str(), (int)s.size(), out.data(), (int)out.size(), nullptr, nullptr);
+    return out;
+}
 
 bool ClassIs(HWND h, const wchar_t* name) {
     wchar_t cls[64];
@@ -1968,7 +1988,17 @@ void KeepHidden(HWND w) {
 
 // The preview has a fixed size and place: Dia's window doesn't offer its edges for resizing, and isn't
 // moved, sized or maximized from its system menu.
+// The size the window is being given on purpose (open as tab: wider than the screen, its sidebar off it):
+// kept even though Windows caps a window near the screen's size while it handles the move.
+SIZE g_wantSize{};
+
 LRESULT CALLBACK FixedProc(HWND h, UINT msg, WPARAM wp, LPARAM lp, UINT_PTR, DWORD_PTR) {
+    if (msg == WM_WINDOWPOSCHANGING && g_wantSize.cx > 0) {
+        LRESULT r = DefSubclassProc(h, msg, wp, lp);
+        auto* pos = reinterpret_cast<WINDOWPOS*>(lp);
+        if (!(pos->flags & SWP_NOSIZE)) pos->cx = g_wantSize.cx, pos->cy = g_wantSize.cy;
+        return r;
+    }
     if (msg == WM_NCHITTEST) {
         LRESULT r = DefSubclassProc(h, msg, wp, lp);
         return (r >= HTLEFT && r <= HTBOTTOMRIGHT) || r == HTCAPTION || r == HTMAXBUTTON || r == HTMINBUTTON ? HTCLIENT : r;
@@ -2128,6 +2158,12 @@ struct {
     RECT card{};      // where it starts
     std::wstring title;
     ULONGLONG started = 0, revealedAt = 0, landedAt = 0;
+    ULONGLONG rowSince = 0;  // when step 3 first looked for the tab row
+    ULONGLONG clickedAt = 0;  // when the tab was last right-clicked
+    int clicks = 0;
+    bool covered = false;  // the picture of the page is up (see BeforeMove)
+    ULONGLONG laidOutAt = 0;  // the window last sized to put its page on yours
+    int layouts = 0;
     int step = 0;  // 5 laid out yet?, 6 shown: settle, 3 right-click, 1 menu, 2 moved?
     HWINEVENTHOOK popHook = nullptr;
     POINT pageOff{};  // where the page sits in its window (measured before the growth)
@@ -2144,6 +2180,8 @@ struct {
     std::vector<HWND> cloaked;
 } g_move;
 const ULONGLONG kMoveTimeoutMs = 3000, kShownSettleMs = 60, kLandMaxMs = 350;
+const ULONGLONG kMenuWaitMs = 500;  // a right-click's menu is open by then, or isn't coming
+const int kMaxClicks = 3;
 const ULONGLONG kDrawnMs = 34;  // the page at its new size is drawn this long after Dia reports the size
 
 // Windows Dia makes or shows while the tab moves (its tab menu and submenu) are never seen.
@@ -2206,6 +2244,33 @@ double SampleDiff(const std::vector<BYTE>& a, const std::vector<BYTE>& b) {
     return sum / (a.size() * 3 / 4);
 }
 
+// A right-click at a screen point as a pen's barrel-button tap: Dia's tab row takes it as a right-click,
+// and the mouse pointer stays where it is (no jump to the row and back). False if Windows won't inject pen
+// input (then the mouse is used).
+bool PenRightClick(POINT at) {
+    static HSYNTHETICPOINTERDEVICE pen = CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE);
+    if (!pen) return false;
+    POINTER_TYPE_INFO info{};
+    info.type = PT_PEN;
+    auto& p = info.penInfo;
+    p.pointerInfo.pointerType = PT_PEN;
+    p.pointerInfo.ptPixelLocation = at;
+    p.penMask = PEN_MASK_PRESSURE;
+    p.penFlags = PEN_FLAG_BARREL;
+    p.pressure = 512;
+    p.pointerInfo.pointerFlags = POINTER_FLAG_INRANGE | POINTER_FLAG_UPDATE;
+    InjectSyntheticPointerInput(pen, &info, 1);
+    p.pointerInfo.pointerFlags = POINTER_FLAG_DOWN | POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT;
+    if (!InjectSyntheticPointerInput(pen, &info, 1)) return false;
+    p.pointerInfo.pointerFlags = POINTER_FLAG_UP | POINTER_FLAG_INRANGE;
+    p.pressure = 0;
+    InjectSyntheticPointerInput(pen, &info, 1);
+    p.penFlags = PEN_FLAG_NONE;
+    p.pointerInfo.pointerFlags = POINTER_FLAG_UPDATE;  // (out of range: the pen's gone)
+    InjectSyntheticPointerInput(pen, &info, 1);
+    return true;
+}
+
 void EndMove(bool moved) {
     KillTimer(g_msg, kTimerTab);
     HidePopups(false);
@@ -2233,10 +2298,14 @@ void LayOutAtPageSize(HWND win, const RECT& pageArea) {
     RECT wr, pr;
     if (!host || !GetWindowRect(win, &wr) || !GetWindowRect(host, &pr)) return;
     g_move.pageOff = {pr.left - wr.left, pr.top - wr.top};
-    SetWindowPos(win, nullptr, pageArea.left - (pr.left - wr.left), pageArea.top - (pr.top - wr.top),
-                 (wr.right - wr.left) + ((pageArea.right - pageArea.left) - (pr.right - pr.left)),
-                 (wr.bottom - wr.top) + ((pageArea.bottom - pageArea.top) - (pr.bottom - pr.top)),
+    g_move.laidOutAt = GetTickCount64();
+    g_move.layouts++;
+    int cx = (wr.right - wr.left) + ((pageArea.right - pageArea.left) - (pr.right - pr.left));
+    int cy = (wr.bottom - wr.top) + ((pageArea.bottom - pageArea.top) - (pr.bottom - pr.top));
+    g_wantSize = {cx, cy};
+    SetWindowPos(win, nullptr, pageArea.left - (pr.left - wr.left), pageArea.top - (pr.top - wr.top), cx, cy,
                  SWP_NOZORDER | SWP_NOACTIVATE);
+    g_wantSize = {};
 }
 
 // The live page, drawn at your page's size: shown under the growing picture, which dissolves into it over
@@ -2244,6 +2313,16 @@ void LayOutAtPageSize(HWND win, const RECT& pageArea) {
 void ShowMovedPage() {
     HWND w = g_move.win;
     const RECT& a = g_move.pageArea;
+    // Where the page is in the window now, and the window placed to put it exactly on yours.
+    if (HWND host = PageHostOf(w)) {
+        RECT wr, pr;
+        if (GetWindowRect(w, &wr) && GetWindowRect(host, &pr)) {
+            g_move.pageOff = {pr.left - wr.left, pr.top - wr.top};
+            if (pr.left != a.left || pr.top != a.top)
+                SetWindowPos(w, nullptr, wr.left + (a.left - pr.left), wr.top + (a.top - pr.top), 0, 0,
+                             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOSIZE);
+        }
+    }
     POINT o = g_move.pageOff;
     SetWindowRgn(w, CreateRectRgn(o.x, o.y, o.x + (a.right - a.left), o.y + (a.bottom - a.top)), TRUE);
     SetWindowPos(w, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -2273,7 +2352,11 @@ void MoveTab(HWND win, HWND dia, const RECT& pageArea, const RECT& card, const s
     GetWindowTextW(dia, t, 256);
     g_move.title = t;
     g_move.started = GetTickCount64();
-    g_move.revealedAt = g_move.landedAt = 0;
+    g_move.revealedAt = g_move.landedAt = g_move.rowSince = g_move.clickedAt = 0;
+    g_move.clicks = 0;
+    g_move.covered = false;
+    g_move.laidOutAt = 0;
+    g_move.layouts = 0;
     g_move.step = 0;
     SetWindowLongPtrW(win, GWLP_HWNDPARENT, 0);  // (not destroyed with the backdrop)
     Ui_SetPeekWindow(win);                       // (its toolbar stays as Dia lays it out)
@@ -2290,6 +2373,8 @@ void MoveTab(HWND win, HWND dia, const RECT& pageArea, const RECT& card, const s
 // the page covers it while it changes windows.
 void BeforeMove() {
     if (!g_move.win || !g_ctl || g_move.style == kMoveFirst) return;  // (move first: the picture stays)
+    if (g_move.covered) return;  // (once: taken while the page was still where it belongs)
+    g_move.covered = true;
     // What's on the screen there (the live page): a picture of the window can come out blank or a frame old.
     const RECT& a = g_move.pageArea;
     int w = a.right - a.left, h = a.bottom - a.top;
@@ -2318,7 +2403,16 @@ void MoveTick() {
                      std::abs((pr.bottom - pr.top) - (a.bottom - a.top)) <= 2;
         ULONGLONG now = GetTickCount64();
         if (sized && !g_move.sizedAt) g_move.sizedAt = now;
-        if ((g_move.sizedAt && now - g_move.sizedAt >= kDrawnMs) || age > 1000) ShowMovedPage();
+        // Not your page's size yet: the window's size came from another window's measurements, and Dia lays
+        // this one out a little differently. Measured again and corrected, a few times.
+        if (!sized && host && g_move.layouts < 5 && now - g_move.laidOutAt > 120) LayOutAtPageSize(w, a);
+        if ((g_move.sizedAt && now - g_move.sizedAt >= kDrawnMs) || age > 1200) {
+            RECT wr{};
+            GetWindowRect(w, &wr);
+            if (!sized) Log("peek: open as tab: the page is %ldx%ld, not %ldx%ld (window %ld,%ld-%ld,%ld, %d layouts)", pr.right - pr.left,
+                            pr.bottom - pr.top, a.right - a.left, a.bottom - a.top, wr.left, wr.top, wr.right, wr.bottom, g_move.layouts);
+            ShowMovedPage();
+        }
         return;
     }
     if (g_move.step == 20 || g_move.step == 21 || g_move.step == 22) {  // split: your tab's menu, "Open as split"; then a moment to show it
@@ -2351,8 +2445,10 @@ void MoveTick() {
                 return in;
             };
             HidePopups(true);
-            INPUT in[4] = {abs(at, 0), abs(at, MOUSEEVENTF_RIGHTDOWN), abs(at, MOUSEEVENTF_RIGHTUP), abs(back, 0)};
-            SendInput(4, in, sizeof(INPUT));
+            if (!PenRightClick(at)) {
+                INPUT in[4] = {abs(at, 0), abs(at, MOUSEEVENTF_RIGHTDOWN), abs(at, MOUSEEVENTF_RIGHTUP), abs(back, 0)};
+                SendInput(4, in, sizeof(INPUT));
+            }
             g_move.step = 22;
             return;
         }
@@ -2370,13 +2466,20 @@ void MoveTick() {
     }
     if (g_move.step == 6) {
         if (GetTickCount64() < g_move.revealedAt + kShownSettleMs) return;
-        SetForegroundWindow(w);
+        // The picture of the page goes up now: brought to the front (and right-clicked), the preview's window
+        // can lay itself out again, its page shifted, until the tab has moved.
+        BeforeMove();
+        if (!SetForegroundWindow(w)) Log("peek: open as tab: the preview's window can't come to the front");
         g_move.step = 3;
     }
     if (g_move.step == 3) {
         RECT row;
         if (!IsWindow(w) || !Ui_PeekTabRow(w, row)) {
-            Log("peek: open as tab: no tab row");
+            // (Dia may not have laid the tab out yet: it's looked for again for a moment)
+            ULONGLONG now = GetTickCount64();
+            if (!g_move.rowSince) g_move.rowSince = now;
+            if (IsWindow(w) && now - g_move.rowSince < 1500) return;
+            Log("peek: open as tab: no tab row (%s)", U8(IsWindow(w) ? Ui_PeekTabInfo(w) : L"window gone").c_str());
             return EndMove(false);
         }
         // The part of the row left of the page (it lies over your sidebar), let through for a right-click,
@@ -2385,8 +2488,27 @@ void MoveTick() {
         if (HWND host = PageHostOf(w)) GetWindowRect(host, &page);
         under.left = row.left + 2;
         under.right = (std::min)(row.right, page.left - 2);
+        // The preview's window sits so its page is on the card: its sidebar can run off the screen's edge.
+        // A click off the screen would land on the edge (another window), so only what's on it is clicked.
+        MONITORINFO mi{sizeof(mi)};
+        if (GetMonitorInfoW(MonitorFromRect(&page, MONITOR_DEFAULTTONEAREST), &mi)) {
+            under.left = (std::max)(under.left, mi.rcMonitor.left + 2);
+            under.right = (std::min)(under.right, mi.rcMonitor.right - 2);
+            under.top = (std::max)(under.top, mi.rcMonitor.top);
+            under.bottom = (std::min)(under.bottom, mi.rcMonitor.bottom);
+        }
         if (under.right - under.left < 4) {
-            Log("peek: open as tab: the tab row is hidden");
+            // (the window may not be laid out at its new size yet: looked at again for a moment)
+            ULONGLONG now = GetTickCount64();
+            if (!g_move.rowSince) g_move.rowSince = now;
+            if (now - g_move.rowSince < 1500) return;
+            RECT wr{};
+            GetWindowRect(w, &wr);
+            BOOL cloaked = FALSE;
+            DwmGetWindowAttribute(w, DWMWA_CLOAKED, &cloaked, sizeof(cloaked));
+            Log("peek: open as tab: the tab row is hidden (row %ld,%ld-%ld,%ld, page %ld,%ld-%ld,%ld, window %ld,%ld-%ld,%ld%s; %s)",
+                row.left, row.top, row.right, row.bottom, page.left, page.top, page.right, page.bottom, wr.left, wr.top,
+                wr.right, wr.bottom, cloaked ? ", cloaked" : "", U8(Ui_PeekTabInfo(w)).c_str());
             return EndMove(false);
         }
         HDC screen = GetDC(nullptr), mem = CreateCompatibleDC(screen);
@@ -2412,6 +2534,17 @@ void MoveTick() {
         HidePopups(true);
         POINT at{(under.left + under.right) / 2, (under.top + under.bottom) / 2}, back;
         GetCursorPos(&back);
+        {
+            HWND hit = WindowFromPoint(at), root = hit ? GetAncestor(hit, GA_ROOT) : nullptr;
+            wchar_t cls[64] = L"", title[128] = L"";
+            if (root) GetClassNameW(root, cls, 64), GetWindowTextW(root, title, 128);
+            wchar_t fg[128] = L"";
+            GetWindowTextW(GetForegroundWindow(), fg, 128);
+            Log("peek: open as tab: right-click at %ld,%ld (row %ld,%ld-%ld,%ld, page left %ld) hits %s '%s' [%s]; in front '%s'",
+                at.x, at.y, row.left, row.top, row.right, row.bottom, page.left,
+                root == w ? "the preview" : root == g_move.dia ? "YOUR window" : "another window", U8(title).c_str(),
+                U8(cls).c_str(), U8(fg).c_str());
+        }
         auto abs = [](POINT pt, DWORD flags) {
             INPUT in{};
             in.type = INPUT_MOUSE;
@@ -2423,8 +2556,13 @@ void MoveTick() {
             in.mi.dwExtraInfo = kReplayTag;
             return in;
         };
-        INPUT in[4] = {abs(at, 0), abs(at, MOUSEEVENTF_RIGHTDOWN), abs(at, MOUSEEVENTF_RIGHTUP), abs(back, 0)};
-        SendInput(4, in, sizeof(INPUT));
+        if (!PenRightClick(at)) {
+            Log("peek: open as tab: no pen input (%lu); the mouse right-clicks", GetLastError());
+            INPUT in[4] = {abs(at, 0), abs(at, MOUSEEVENTF_RIGHTDOWN), abs(at, MOUSEEVENTF_RIGHTUP), abs(back, 0)};
+            SendInput(4, in, sizeof(INPUT));
+        }
+        g_move.clickedAt = GetTickCount64();
+        g_move.clicks++;
         g_move.step = 1;
         return;
     }
@@ -2434,8 +2572,19 @@ void MoveTick() {
             g_move.step = 2;
             return;
         }
-        if (r < 0 || age > kMoveTimeoutMs) {
-            Log("peek: open as tab: no Move to Window (%d)", r);
+        // No menu yet: something else may have taken the front and closed it. The preview's brought to
+        // the front and its tab right-clicked again, a few times.
+        if (r == 0 && IsWindow(w) && GetTickCount64() - g_move.clickedAt > kMenuWaitMs && !Ui_PeekMenuOpen(w)) {
+            if (g_move.clicks < kMaxClicks) {
+                Log("peek: open as tab: no menu after a right-click; again (%s)", U8(Ui_PeekMenuInfo(w)).c_str());
+                if (!SetForegroundWindow(w)) Log("peek: open as tab: the preview's window can't come to the front");
+                g_move.step = 3;
+                return;
+            }
+            r = -1;
+        }
+        if (r < 0 || GetTickCount64() - g_move.clickedAt > kMoveTimeoutMs) {
+            Log("peek: open as tab: no Move to Window (%d; %s)", r, U8(IsWindow(w) ? Ui_PeekMenuInfo(w) : L"window gone").c_str());
             return EndMove(false);
         }
         return;
@@ -2473,7 +2622,7 @@ void MoveTick() {
         }
         return;
     }
-    if (age > kMoveTimeoutMs + 1500) EndMove(false);
+    if (GetTickCount64() - g_move.clickedAt > kMoveTimeoutMs + 1500) EndMove(false);
 }
 
 // Close (or, keep: fill the page and open as a tab). The card takes a picture of the page, Dia's window
@@ -2696,8 +2845,9 @@ void DiaTick() {
         if (age > kRetryMs && !p->retried && p->injectStep == 3) {  // (once more: Dia missed the first)
             p->retried = true;
             Log("peek: no window yet, clicking the link again");
-            SendShift(true);
             p->injectStep = 1;
+            Publish();
+            SendShift(true);
             p->started = GetTickCount64() - kRetryMs;  // (the time left counts from here)
             SetTimer(g_msg, kTimerInject, 25, nullptr);
             return;
@@ -2836,12 +2986,14 @@ void InjectStep() {
         return;
     }
     if (p->injectStep == 1) {
-        ClickAt(p->origin);
         p->injectStep = 2;
+        Publish();
+        ClickAt(p->origin);
         return;
     }
     SendShift(false);
     p->injectStep = 3;
+    Publish();
     KillTimer(g_msg, kTimerInject);
     if (!p->warm && !p->backdrop) StartCard(p);  // (once: a retry clicks again, the card's out already)
 }
@@ -2878,6 +3030,7 @@ bool Open(HWND widget, POINT click, const std::wstring& url, bool warm = false) 
     p->url = url;
     p->warm = warm;
     g_peek = p;
+    Publish();
     p->started = GetTickCount64();
     // Dia opens the link: Shift+click, the press and release at the link (the page never saw the real
     // press). The modifier-click triggers keep their keys down: those are released first.
@@ -2888,8 +3041,9 @@ bool Open(HWND widget, POINT click, const std::wstring& url, bool warm = false) 
         if (g_alt) up[n].type = INPUT_KEYBOARD, up[n].ki.wVk = VK_MENU, up[n++].ki.dwFlags = KEYEVENTF_KEYUP;
         if (n) SendInput(n, up, sizeof(INPUT));
     }
+    p->injectStep = 1;  // (before the Shift goes down: the key hook keeps your Shift held from here)
+    Publish();
     SendShift(true);
-    p->injectStep = 1;
     SetTimer(g_msg, kTimerInject, 25, nullptr);
     SetTimer(g_msg, kTimerDia, 15, nullptr);
     Log("peek: opening %ls", HostOf(url).c_str());
@@ -3090,6 +3244,7 @@ LRESULT CALLBACK MsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
         }
     } catch (...) {
     }
+    Publish();  // (whatever the message changed, for the input hooks)
     return DefWindowProcW(h, msg, wp, lp);
 }
 
@@ -3102,7 +3257,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
         if (g_trigger == kHold && !ours) {
             int st = g_hold;
             if (wp == WM_LBUTTONDOWN) {
-                if (st == kIdle && !g_peek && !g_shift && !g_ctrl && !g_alt && !g_win && DiaIsForeground()) {
+                if (st == kIdle && !g_hasPeek && !g_shift && !g_ctrl && !g_alt && !g_win && DiaIsForeground()) {
                     if (HWND w = PageWidgetAt(m->pt)) {
                         g_holdPt = m->pt;
                         g_holdWidget = w;
@@ -3125,7 +3280,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                     PostMessageW(g_msg, WM_PEEK_REPLAY, 0, 0);
             }
         } else if (g_trigger == kShift && wp == WM_MOUSEMOVE && !ours && g_shift && !g_ctrl && !g_alt && !g_win &&
-                   (!g_peek || g_peek->warm)) {
+                   (!g_hasPeek || g_peekWarm)) {
             static ULONGLONG last = 0;  // (a look at the link under the pointer, at most every 80 ms)
             ULONGLONG now = GetTickCount64();
             if (now - last >= 100) {
@@ -3133,7 +3288,7 @@ LRESULT CALLBACK MouseHook(int code, WPARAM wp, LPARAM lp) {
                 PostMessageW(g_msg, WM_PEEK_WARM, 0, 0);
             }
         }
-        if (g_trigger != kHold && wp == WM_LBUTTONDOWN && !ours && (!g_peek || g_peek->warm)) {
+        if (g_trigger != kHold && wp == WM_LBUTTONDOWN && !ours && (!g_hasPeek || g_peekWarm)) {
             bool shift = g_shift, ctrl = g_ctrl, alt = g_alt;
             int t = g_trigger;
             bool match = !g_win && (t == kShift      ? shift && !ctrl && !alt
@@ -3171,23 +3326,24 @@ LRESULT CALLBACK KeyHook(int code, WPARAM wp, LPARAM lp) {
                                                                                               : nullptr;
         // Shift let go while Peek clicks the link for Dia (a quick Shift+click): Dia would get a plain click
         // and open the link in your tab. Ours lets go once the click is in (InjectStep).
-        if (mod == &g_shift && !down && k->dwExtraInfo != kReplayTag && g_peek && g_peek->phase == kLoading &&
-            (g_peek->injectStep == 1 || g_peek->injectStep == 2)) {
+        if (mod == &g_shift && !down && k->dwExtraInfo != kReplayTag && g_hasPeek && g_peekPhase == kLoading &&
+            (g_peekInject == 1 || g_peekInject == 2)) {
             g_shift = false;
             return 1;
         }
-        if (mod && !(injected && (g_peek || k->dwExtraInfo == kReplayTag))) {  // (our own Shift isn't you)
+        if (mod && !(injected && (g_hasPeek || k->dwExtraInfo == kReplayTag))) {  // (our own Shift isn't you)
             bool was = *mod;
             *mod = down;
             if (mod == &g_shift && g_on && g_trigger == kShift && was != down && !injected) {
                 if (down && !g_ctrl && !g_alt && !g_win) PostMessageW(g_msg, WM_PEEK_WARM, 0, 0);
                 else if (!down) PostMessageW(g_msg, WM_PEEK_COOL, 0, 0);
             }
-        } else if (g_on && down && vk == VK_ESCAPE && g_peek && DiaIsForeground()) {
+        } else if (g_on && down && vk == VK_ESCAPE && g_hasPeek && DiaIsForeground()) {
             PostMessageW(g_msg, WM_PEEK_ESC, 0, 0);
             return 1;
-        } else if (g_on && down && (vk == 'W' || vk == 'O') && g_ctrl && !g_shift && !g_alt && g_peek &&
-                   g_peek->phase == kOpen && DiaIsForeground()) {  // DiaTweaks' Close Ctrl+W, Expand Ctrl+O
+        } else if (g_on && down && (vk == 'W' || vk == 'O') && g_ctrl && !g_shift && !g_alt &&
+                   k->dwExtraInfo != kReplayTag && g_hasPeek && g_peekPhase == kOpen &&
+                   DiaIsForeground()) {  // DiaTweaks' Close Ctrl+W, Expand Ctrl+O
             PostMessageW(g_msg, WM_PEEK_ESC, vk == 'O', 0);
             return 1;
         }
@@ -3203,13 +3359,25 @@ void Install() {
     wc.lpszClassName = L"DiaTweaksPeekMsg";
     RegisterClassW(&wc);
     g_msg = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&MouseHook, &self);
-    g_mouse = SetWindowsHookExW(WH_MOUSE_LL, MouseHook, self, 0);
-    g_keys = SetWindowsHookExW(WH_KEYBOARD_LL, KeyHook, self, 0);
-    if (!g_mouse || !g_keys) Log("peek: hook failed %lu", GetLastError());
-    else Log("peek: ready on thread %lu", g_thread);
+    Log("peek: ready on thread %lu", g_thread);
+}
+
+// The mouse and key hooks: on while Peek is on, off (no cost to your input) while it's off.
+void SetInputHooks(bool on) {
+    static bool failed = false;  // (not tried again every tick: once more after Peek is turned off and on)
+    if (!on) failed = false;
+    if (on == g_inputHooks.Running() || (on && failed)) return;
+    if (!on) {
+        g_inputHooks.Stop();
+        g_hold = kIdle;
+        g_swallowUp = false;
+        Log("peek: input hooks off");
+    } else if (g_inputHooks.Start(MouseHook, KeyHook)) {
+        Log("peek: input hooks on");
+    } else {
+        failed = true;
+        Log("peek: hook failed %lu", g_inputHooks.Error());
+    }
 }
 
 }  // namespace
@@ -3238,7 +3406,11 @@ void Peek_Tick() {
     if (GetCurrentThreadId() != g_thread) return;
     if (!on) {
         if (g_peek) Destroy();
+        Publish();
+        SetInputHooks(false);
         return;
     }
+    SetInputHooks(true);
     Follow();
+    Publish();
 }

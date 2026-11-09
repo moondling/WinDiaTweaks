@@ -2338,6 +2338,48 @@ void ShowMovedPage() {
 
 bool g_splitNext = false;  // (the next MoveTab ends in a split)
 
+// A split's page window (Chromium's, inside Dia's window, one per pane). When a split Peek made is closed,
+// Dia leaves its pane's page window shown with no page in it; after Peek's split it still holds the last
+// frame it drew, a block of the old page over the page area. Such a window is hidden once it has lost its
+// page, and shown again if Dia puts a page in it.
+struct SplitPane {
+    HWND w;
+    bool hidden;
+};
+std::vector<SplitPane> g_panes;
+
+void RememberSplitPanes(HWND dia, const RECT& pageArea) {
+    for (HWND c = FindWindowExW(dia, nullptr, L"Chrome_WidgetWin_1", nullptr); c;
+         c = FindWindowExW(dia, c, L"Chrome_WidgetWin_1", nullptr)) {
+        RECT r;
+        if (!GetWindowRect(c, &r) || (r.right - r.left) >= (pageArea.right - pageArea.left) - 8) continue;  // (a pane: narrower than the page)
+        bool known = false;
+        for (auto& p : g_panes) known |= p.w == c;
+        if (!known) g_panes.push_back({c, false});
+    }
+}
+
+void TidySplitPanes() {
+    for (size_t i = 0; i < g_panes.size();) {
+        auto& p = g_panes[i];
+        if (!IsWindow(p.w)) {
+            g_panes.erase(g_panes.begin() + i);
+            continue;
+        }
+        bool hasPage = FindWindowExW(p.w, nullptr, L"Chrome_RenderWidgetHostHWND", nullptr) != nullptr;
+        bool shown = GetWindowLongW(p.w, GWL_STYLE) & WS_VISIBLE;
+        if (shown && !hasPage) {
+            ShowWindow(p.w, SW_HIDE);
+            p.hidden = true;
+            Log("peek: split closed: its pane's leftover page window hidden");
+        } else if (p.hidden && hasPage && !shown) {
+            ShowWindow(p.w, SW_SHOWNA);
+            p.hidden = false;
+        }
+        i++;
+    }
+}
+
 void MoveTab(HWND win, HWND dia, const RECT& pageArea, const RECT& card, const std::wstring& url, int style) {
     g_move.win = win;
     g_move.dia = dia;
@@ -2421,7 +2463,10 @@ void MoveTick() {
             auto now = SampleScreen(g_move.pageArea);
             if (g_move.splitLook.empty()) g_move.splitLook = now;
             g_move.stable = SampleDiff(now, g_move.splitLook) > 6.0 ? g_move.stable + 1 : 0;
-            if (g_move.stable >= 2 || since >= 400) EndMove(true);
+            if (g_move.stable >= 2 || since >= 400) {
+                RememberSplitPanes(g_move.dia, g_move.pageArea);
+                EndMove(true);
+            }
             return;
         }
         if (g_move.step == 20) {  // your tab's row right-clicked (its menu opens hidden: HidePopups)
@@ -3412,5 +3457,6 @@ void Peek_Tick() {
     }
     SetInputHooks(true);
     Follow();
+    if (!g_move.win) TidySplitPanes();
     Publish();
 }

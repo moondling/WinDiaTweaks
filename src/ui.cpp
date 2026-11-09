@@ -4267,10 +4267,13 @@ static void ArcStyleHeader(ArcState& st) {
         auto c = el.Margin();
         if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Top - m.Top) > 0.1 || std::abs(c.Right - m.Right) > 0.1) el.Margin(m);
     }
+    double leftEnd = logoX + logo.ActualWidth() + (left.Visibility() == mux::Visibility::Visible ? left.ActualWidth() : 0);
+    double contentStart = leftEnd;  // where Dia's profile / space name may begin
     // Profile emoji patch: right after the sidebar button, on the same line (it would sit under it).
     for (auto const& c : header.Children())
         if (auto em = c.try_as<muxc::TextBlock>(); em && em.Name() == L"diatweaksProfileEmoji") {
-            double x = logoX + logo.ActualWidth() + (left.Visibility() == mux::Visibility::Visible ? left.ActualWidth() : 0) + 6;
+            double x = leftEnd + 6;
+            if (em.Visibility() == mux::Visibility::Visible) contentStart = x + em.ActualWidth() + 2;
             // Same visual size as the icons; color emoji glyphs sit low in their line box, so lift it.
             if (em.FontSize() != 14) HeaderSet(st, em, muxc::TextBlock::FontSizeProperty(), winrt::box_value(14.0));
             double y = top + (std::max)(0.0, (32 - em.ActualHeight()) / 2) - 1.5;
@@ -4282,6 +4285,27 @@ static void ArcStyleHeader(ArcState& st) {
             if (std::abs(m.Left - x) > 0.1 || std::abs(m.Top - y) > 0.1)
                 HeaderSet(st, em, mux::FrameworkElement::MarginProperty(), winrt::box_value(mux::Thickness{x, y, 0, 0}));
         }
+    // With more than one profile Dia shows its name (the space switcher) in the middle column, which
+    // starts where the sidebar button now sits: move it past that button, and keep it off ← → ↻.
+    if (auto host = FindByName(header, L"HeaderContentHost"); host && cols >= 3) {
+        auto defs = header.ColumnDefinitions();
+        double colStart = defs.GetAt(0).ActualWidth();
+        double colEnd = header.ActualWidth() - defs.GetAt(cols - 1).ActualWidth();
+        double rightStart = right.Visibility() == mux::Visibility::Visible ? header.ActualWidth() - edge - right.ActualWidth() : colEnd;
+        // Dia centers the name a little above the icons' line: shift it (top and bottom alike, so its
+        // height stays the same) until its middle meets the icons' middle.
+        auto c = host.Margin();
+        double dy = c.Top;
+        if (auto title = FindByName(host, L"TitleTextPresenter"); title && title.ActualHeight() > 0)
+            try {
+                double y = title.TransformToVisual(header).TransformPoint({0, 0}).Y - c.Top;
+                dy = top + 16 - (y + title.ActualHeight() / 2) - 0.6;  // capitals sit a bit below their line's middle
+            } catch (...) {
+            }
+        mux::Thickness m{(std::max)(0.0, contentStart - colStart), dy, (std::max)(0.0, colEnd - rightStart + 4), -dy};
+        if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Right - m.Right) > 0.1 || std::abs(c.Top - m.Top) > 0.1)
+            HeaderSet(st, host, mux::FrameworkElement::MarginProperty(), winrt::box_value(m));
+    }
     // The Dia logo: a faint 16 px shape; drawn like the other icons (their color, optically their size).
     auto ref = FindByName(st.right.get(), L"BackButton").try_as<muxc::Control>();
     if (!ref && overflow) ref = overflow.try_as<muxc::Control>();

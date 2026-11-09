@@ -1067,6 +1067,14 @@ static std::vector<std::string> MergeConf(const std::vector<std::string>& fresh,
         if (header(l, key, rest)) state[key] = rest;
         else if (!key.empty() && isValue(l)) value[key] = l;
     }
+    // The first toolbar-height prototype had a Default choice; the picker now always shows a height.
+    if (value.count("toolbarHeight")) {
+        auto v = value["toolbarHeight"];
+        v.erase(0, v.find(':') + 1);
+        v.erase(0, v.find_first_not_of(" \t"));
+        v.erase(v.find_last_not_of(" \t") + 1);
+        if (v == "default") value["toolbarHeight"] = "value: 36";
+    }
     // Renamed tweaks: your choice carries over to the one that replaced it. Toolbar color = Sidebar became
     // Toolbar in the title bar (on); Adaptive (or the tweak off) leaves it off.
     if (state.count("toolbarColor") && !state.count("titleBar")) {

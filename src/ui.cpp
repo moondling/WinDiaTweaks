@@ -214,7 +214,10 @@ static void DescribeElement(std::ostringstream& o, const mux::FrameworkElement& 
         } catch (...) {
         }
     }
-    if (fe.Clip()) o << " xamlclip";
+    if (auto clip = fe.Clip()) {
+        auto r = clip.Rect();
+        o << " xamlclip=[" << r.X << "," << r.Y << " " << r.Width << "x" << r.Height << "]";
+    }
     o << " row=" << muxc::Grid::GetRow(fe) << " col=" << muxc::Grid::GetColumn(fe);
     if (auto g = fe.try_as<muxc::Grid>()) {
         o << " rows=[";
@@ -4726,6 +4729,15 @@ static bool ToolbarReadyForMove(const mux::FrameworkElement& bar) {
     std::erase_if(pending, [](auto& p) { return !p.bar.get(); });
     if (!bar || !bar.IsLoaded()) return false;
     auto address = FindByName(bar, L"AssistantBarHost");
+    // New chat has a collapsed address host and no bookmark/site-menu controls to wait for. Its
+    // command bar is already on the page, so move the toolbar without the two-second fallback delay.
+    if (address && address.IsLoaded() && address.Visibility() == mux::Visibility::Collapsed) {
+        auto command = FindInRoot(L"CommandBarContainerRoot", bar.XamlRoot());
+        if (command && ShownOnScreen(command)) {
+            std::erase_if(pending, [&](auto& p) { return p.bar.get() == bar; });
+            return true;
+        }
+    }
     auto menu = address ? FindByName(address, L"SiteMenuButton") : nullptr;
     auto bookmark = address ? FindByName(address, L"BookmarkButton") : nullptr;
     if (address && address.IsLoaded() && menu && menu.IsLoaded() && bookmark && bookmark.IsLoaded()) {
@@ -5425,6 +5437,7 @@ struct ArcWinBar {
     mux::FrameworkElement trailingHit{nullptr};
     SavedProp trailingHitSaved, trailingOpacity;
     int64_t trailingHitToken = 0, trailingOpacityToken = 0;
+    SavedProp hiddenBookmark;
 };
 static thread_local std::map<InstanceHandle, ArcWinBar> t_arcWin;
 
@@ -5461,6 +5474,8 @@ static void RestoreArcWinTrailing(ArcWinBar& b) {
 }
 
 static void PutBackArcWin(ArcWinBar& b) {
+    PutBack(b.hiddenBookmark);
+    b.hiddenBookmark = {};
     RestoreAddress(b.display);
     PutBackArcWinButtons(b);
     PutBack(b.fieldClip);
@@ -5544,6 +5559,19 @@ static void LayoutArcWin(ArcWinBar& b) {
     if (!bar || !label || !pill) return;
     auto source = b.st.source.get();
     auto host = source ? FindByName(source, L"AssistantBarHost") : nullptr;
+    auto bookmark = host ? FindByName(host, L"BookmarkButton") : nullptr;
+    auto siteMenu = host ? FindByName(host, L"SiteMenuButton") : nullptr;
+    // Dia hides the site menu on chat pages, but leaves the bookmark button visible. Centered exposes
+    // that button permanently, so follow the site menu and restore Dia's binding when a site returns.
+    bool hideBookmark = bookmark && siteMenu && siteMenu.Visibility() != mux::Visibility::Visible;
+    if (b.hiddenBookmark.dp && (b.hiddenBookmark.el.get() != bookmark || !hideBookmark)) {
+        PutBack(b.hiddenBookmark);
+        b.hiddenBookmark = {};
+    }
+    if (hideBookmark) {
+        if (!b.hiddenBookmark.dp) b.hiddenBookmark = SaveProp(bookmark, mux::UIElement::VisibilityProperty());
+        if (bookmark.Visibility() != mux::Visibility::Collapsed) bookmark.Visibility(mux::Visibility::Collapsed);
+    }
     bool shown = host && host.Visibility() == mux::Visibility::Visible && host.ActualWidth() > 0;
     if (shown) AttachArcWinDisplay(b, host);
     auto reb = b.display.el.try_as<muxc::RichEditBox>();
@@ -5551,13 +5579,29 @@ static void LayoutArcWin(ArcWinBar& b) {
     std::wstring text = shown && reb && !Ui_State(L"newTab") ? SiteOnly(reb) : L"";
     // Ctrl+T's bar is opening an address in a new tab: the strip keeps the current tab's buttons (see
     // UpdateArcWindows) but shows the new address straight away, as Arc does.
-    if (auto relay = RelaySite(); !relay.empty() && host) text = relay, shown = true;
+    auto relay = RelaySite();
+    if (!relay.empty() && host) text = relay, shown = true;
+    // A new chat has no visible native address field. Keep the strip empty there; the New Tab page's
+    // card canvas still gets its address prompt, and the floating new-tab relay can supply its text.
+    auto pageGroup = b.group.get();
+    auto cards = pageGroup ? FindByName(pageGroup, L"CardCanvas") : nullptr;
+    if (!shown && relay.empty() && !(cards && ShownOnScreen(cards))) {
+        if (label.Visibility() != mux::Visibility::Collapsed) label.Visibility(mux::Visibility::Collapsed);
+        if (pill.Visibility() != mux::Visibility::Collapsed) pill.Visibility(mux::Visibility::Collapsed);
+        PutBackArcWinButtons(b);
+        PutBack(b.fieldClip);
+        b.fieldClip = {};
+        b.clipped = nullptr;
+        RestoreArcWinTrailing(b);
+        return;
+    }
     // No site (Dia's start page, an empty tab): Arc's "Search or Enter URL…" pill, which opens the
     // command bar (Dia's own field is hidden there, so the pill takes the click itself).
     bool empty = text.empty();
     if (empty) text = L"Search or Enter URL…";
     if (label.Text() != text) label.Text(text);
-    if (label.Visibility() != mux::Visibility::Visible) label.Visibility(mux::Visibility::Visible), pill.Visibility(mux::Visibility::Visible);
+    if (label.Visibility() != mux::Visibility::Visible) label.Visibility(mux::Visibility::Visible);
+    if (pill.Visibility() != mux::Visibility::Visible) pill.Visibility(mux::Visibility::Visible);
     // The pill is the site's button, as in Arc: a click opens the command bar (Ctrl+L), whatever Dia's
     // field under it does.
     if (!pill.IsHitTestVisible()) pill.IsHitTestVisible(true);
@@ -5680,9 +5724,16 @@ static void LayoutArcWin(ArcWinBar& b) {
         }
         if (auto clip = host.Clip()) {
             double hx = host.TransformToVisual(bar).TransformPoint({0, 0}).X;
-            winrt::Windows::Foundation::Rect r{(float)(x - hx - 2), 0.0f, (float)(group + 4), (float)host.ActualHeight()};
+            double top = 0, bottom = host.ActualHeight();
+            if (trailing && trailing.ActualHeight() > 0) {
+                double y = trailing.TransformToVisual(host).TransformPoint({0, 0}).Y;
+                top = (std::min)(top, y);
+                bottom = (std::max)(bottom, y + trailing.ActualHeight());
+            }
+            winrt::Windows::Foundation::Rect r{(float)(x - hx - 2), (float)top, (float)(group + 4), (float)(bottom - top)};
             auto cur = clip.Rect();
-            if (std::abs(cur.X - r.X) > 0.5 || std::abs(cur.Width - r.Width) > 0.5 || std::abs(cur.Height - r.Height) > 0.5)
+            if (std::abs(cur.X - r.X) > 0.5 || std::abs(cur.Y - r.Y) > 0.5 ||
+                std::abs(cur.Width - r.Width) > 0.5 || std::abs(cur.Height - r.Height) > 0.5)
                 clip.Rect(r);
         }
     }
@@ -6565,36 +6616,49 @@ static void RemoveTopTabInset(TitleBarState& st, const mux::FrameworkElement& st
     }
 }
 
-static void CompactTitleBar(TitleBarState& st, bool topTabs) {
+static double ToolbarHeightChoice() {
+    auto value = Engine_TweakValue(L"toolbarHeight");
+    if (value == L"32") return 32;
+    if (value == L"36") return 36;
+    if (value == L"40") return 40;
+    return 36;
+}
+
+static void CompactTitleBar(TitleBarState& st) {
     auto bar = st.bar.get();
-    if (!topTabs || !bar) { RestoreTitleCompact(st); return; }
+    if (!bar) { RestoreTitleCompact(st); return; }
+    double height = ToolbarHeightChoice();
+    double controlHeight = (std::min)(32.0, height - 4);
     auto row = st.host.RowDefinitions().GetAt(0);
-    row.MinHeight(36);
-    row.MaxHeight(36);
-    row.Height({36, mux::GridUnitType::Pixel});
+    if (row.MinHeight() > height) row.MinHeight(height);
+    if (row.MaxHeight() != height) row.MaxHeight(height);
+    if (row.MinHeight() != height) row.MinHeight(height);
+    auto rowHeight = row.Height();
+    if (rowHeight.GridUnitType != mux::GridUnitType::Pixel || rowHeight.Value != height)
+        row.Height({height, mux::GridUnitType::Pixel});
     auto size = [&](const mux::FrameworkElement& fe, double height) {
         if (!fe) return;
         TitleSet(st, fe, mux::FrameworkElement::MinHeightProperty(), winrt::box_value(0.0));
         TitleSet(st, fe, mux::FrameworkElement::HeightProperty(), winrt::box_value(height));
         TitleSet(st, fe, mux::FrameworkElement::MaxHeightProperty(), winrt::box_value(height));
     };
-    size(bar, 36);
+    size(bar, height);
     for (auto name : {L"NavigationBarContent", L"diatweaksArcWinStrip", L"diatweaksArcWinPill", L"AssistantBarHost", L"AssistantBar", L"TitleGrid", L"UrlBarHitTarget"}) {
         auto fe = FindByName(bar, name);
         if (!fe) continue;
-        size(fe, std::wstring_view(name) == L"NavigationBarContent" ? 36 : 32);
+        size(fe, std::wstring_view(name) == L"NavigationBarContent" ? height : controlHeight);
         auto m = fe.Margin();
         TitleSet(st, fe, mux::FrameworkElement::MarginProperty(), winrt::box_value(mux::Thickness{m.Left, 0, m.Right, 0}));
         TitleSet(st, fe, mux::FrameworkElement::VerticalAlignmentProperty(), winrt::box_value(mux::VerticalAlignment::Center));
     }
     std::function<void(const mux::DependencyObject&)> buttons = [&](const mux::DependencyObject& parent) {
         if (auto button = parent.try_as<muxc::Button>()) {
-            size(button, 32);
+            size(button, controlHeight);
             TitleSet(st, button, muxc::Control::CornerRadiusProperty(), winrt::box_value(mux::CornerRadius{6, 6, 6, 6}));
             if (auto root = FindVisual(button, [](const mux::DependencyObject& d) { return (bool)d.try_as<muxc::Grid>(); }).try_as<muxc::Grid>())
                 TitleSet(st, root, muxc::Grid::CornerRadiusProperty(), winrt::box_value(mux::CornerRadius{6, 6, 6, 6}));
             if (auto background = FindByName(button, L"BackgroundBorder")) {
-                size(background, 32);
+                size(background, controlHeight);
                 TitleSet(st, background, muxc::Border::CornerRadiusProperty(), winrt::box_value(mux::CornerRadius{6, 6, 6, 6}));
                 auto margin = background.Margin();
                 TitleSet(st, background, mux::FrameworkElement::MarginProperty(),
@@ -6608,7 +6672,7 @@ static void CompactTitleBar(TitleBarState& st, bool topTabs) {
     };
     buttons(bar);
     for (auto& [button, index] : st.chromeButtons) {
-        size(button, 32);
+        size(button, controlHeight);
         TitleSet(st, button, mux::FrameworkElement::MinWidthProperty(), winrt::box_value(0.0));
         TitleSet(st, button, mux::FrameworkElement::WidthProperty(), winrt::box_value(32.0));
         TitleSet(st, button, mux::FrameworkElement::MaxWidthProperty(), winrt::box_value(32.0));
@@ -6692,11 +6756,6 @@ static bool PlaceTopTabs(TitleBarState& st, const mux::XamlRoot& root) {
 static void ReserveTitleButtons(TitleBarState& st, const muxc::Grid& main, bool topTabs) {
     auto bar = st.bar.get();
     if (!bar) return;
-    if (!topTabs) {
-        PutBack(st.topBarMargin);
-        st.topBarMargin = {};
-        return;
-    }
     if (st.topBarMargin.el.get() != bar) {
         PutBack(st.topBarMargin);
         st.topBarMargin = SaveProp(bar, mux::FrameworkElement::MarginProperty());
@@ -6711,7 +6770,7 @@ static void ReserveTitleButtons(TitleBarState& st, const muxc::Grid& main, bool 
                 break;
             }
     auto want = st.topBarBase;
-    if (st.chrome) {
+    if (topTabs && st.chrome) {
         st.chrome.Measure({std::numeric_limits<float>::infinity(), 32});
         double inset = 0;
         for (auto name : {L"SidebarToggleButton", L"BackButton", L"ForwardButton", L"ReloadButton"})
@@ -6721,7 +6780,8 @@ static void ReserveTitleButtons(TitleBarState& st, const muxc::Grid& main, bool 
             }
         want.Left += st.chrome.DesiredSize().Width + (std::max)(0.0, 4.0 - inset);
     }
-    want.Right += reserve;
+    if (topTabs) want.Right += reserve;
+    else want.Right = (std::max)(want.Right, reserve);
     auto cur = bar.Margin();
     if (std::abs(cur.Left - want.Left) > 0.5 || std::abs(cur.Right - want.Right) > 0.5) bar.Margin(want);
 }
@@ -6921,7 +6981,7 @@ static void UpdateTitleBar() {
             st.host.Children().Append(active);
         }
         bool topTabs = PlaceTopTabs(st, root);
-        CompactTitleBar(st, topTabs);
+        CompactTitleBar(st);
         ReserveTitleButtons(st, main, topTabs);
         double lift = AlignTitleBarTop(st, main);
         if (lift >= 0) {
@@ -7598,66 +7658,75 @@ static double NowMs() {
     return c.QuadPart * 1000.0 / f.QuadPart;
 }
 
-// The Arc URL bar in the sidebar: the toolbar that comes down is a thin title bar, as tall as the centered
-// bar's (36: the 32 px buttons, 2 px above and below, tweaks.conf). Its height is the first row of the tab's
-// NavigationChromeHost, outside what the rules reach. Each tab brings its own toolbar and its row is only
-// made thin a layout pass later, so while this applies the slide uses this fixed height, not a measured one.
-static constexpr double kThinBar = 36;
-static bool ThinToolbarOn() { return ArcSidebarOn() && !Ui_State(L"split"); }
+// The toolbar's pane row is outside what the rules reach. Use the selected height for the slide too,
+// before a newly opened tab has completed layout.
+static double RequestedPaneHeight() {
+    return ToolbarHeightChoice();
+}
 
 static double BarHeight(BarAnim& a) {
-    if (ThinToolbarOn()) return kThinBar;
+    if (double height = RequestedPaneHeight()) return height;
     auto b = a.bar.get();
     double h = b ? b.ActualHeight() : 0;
     return h > 1 ? h : 40;
 }
 
-// Dia sets that row again on some tab switches: a watch on it puts 36 back before the next layout, so no
-// frame is drawn with the page 4 px lower.
+// Dia sets the row again on some tab switches: a watch reapplies the selected height before layout.
 struct ThinRow {
     winrt::weak_ref<muxc::RowDefinition> row;
     mux::GridLength dia{};  // Dia's height, given back on off
+    double applied = 0;
     int64_t token = 0;
+    bool changing = false;
 };
 static thread_local std::map<void*, ThinRow> t_thinRows;
 
 static void UpdateThinToolbar() {
-    bool thin = ThinToolbarOn();
+    double height = RequestedPaneHeight();
     for (auto it = t_thinRows.begin(); it != t_thinRows.end();) {
         auto row = it->second.row.get();
-        if (row && thin) {
+        if (row && height) {
             ++it;
             continue;
         }
         if (row) {
             row.UnregisterPropertyChangedCallback(muxc::RowDefinition::HeightProperty(), it->second.token);
-            if (row.Height().Value == kThinBar) row.Height(it->second.dia);
+            auto current = row.Height();
+            if (current.GridUnitType == mux::GridUnitType::Pixel && current.Value == it->second.applied)
+                row.Height(it->second.dia);
         }
         it = t_thinRows.erase(it);
     }
-    if (!thin) return;
+    if (!height) return;
     for (auto h : FindNodes(L"NavigationChromeHost")) {
         auto grid = Obj<muxc::Grid>(h);
         if (!grid || grid.RowDefinitions().Size() == 0) continue;
         auto row = grid.RowDefinitions().GetAt(0);
         auto cur = row.Height();
         if (!t_thinRows.count(winrt::get_abi(row))) {
-            if (cur.GridUnitType != mux::GridUnitType::Pixel || cur.Value <= kThinBar) continue;  // not Dia's fixed row
+            if (cur.GridUnitType != mux::GridUnitType::Pixel || cur.Value <= 0) continue;
             auto key = winrt::get_abi(row);
             auto token = row.RegisterPropertyChangedCallback(muxc::RowDefinition::HeightProperty(),
                 [key](mux::DependencyObject const& o, auto&&) {
                     auto it = t_thinRows.find(key);
                     auto r = o.try_as<muxc::RowDefinition>();
-                    if (it == t_thinRows.end() || !r) return;
+                    if (it == t_thinRows.end() || !r || it->second.changing) return;
                     auto v = r.Height();
-                    if (v.GridUnitType == mux::GridUnitType::Pixel && v.Value == kThinBar) return;
+                    if (v.GridUnitType == mux::GridUnitType::Pixel && v.Value == it->second.applied) return;
                     it->second.dia = v;
-                    r.Height({kThinBar, mux::GridUnitType::Pixel});
+                    it->second.changing = true;
+                    r.Height({it->second.applied, mux::GridUnitType::Pixel});
+                    it->second.changing = false;
                 });
-            t_thinRows[key] = {winrt::make_weak(row), cur, token};
+            t_thinRows[key] = {winrt::make_weak(row), cur, height, token, false};
         }
-        if (cur.Value != kThinBar || cur.GridUnitType != mux::GridUnitType::Pixel)
-            row.Height({kThinBar, mux::GridUnitType::Pixel});
+        auto& state = t_thinRows.at(winrt::get_abi(row));
+        state.applied = height;
+        if (cur.Value != height || cur.GridUnitType != mux::GridUnitType::Pixel) {
+            state.changing = true;
+            row.Height({height, mux::GridUnitType::Pixel});
+            state.changing = false;
+        }
     }
 }
 
@@ -8103,8 +8172,11 @@ static std::vector<winrt::Windows::Graphics::RectInt32> ArcHeaderButtons(const m
         if (!fe || fe.Visibility() != mux::Visibility::Visible || fe.ActualWidth() <= 0 || fe.ActualHeight() <= 0) return;
         if (fe.try_as<muxc::TextBlock>()) return;  // (the profile emoji: nothing to click)
         auto at = fe.TransformToVisual(nullptr).TransformPoint({0, 0});
-        out.push_back({(int)std::floor(at.X * sc), (int)std::floor(at.Y * sc), (int)std::ceil(fe.ActualWidth() * sc),
-                       (int)std::ceil(fe.ActualHeight() * sc)});
+        int left = (std::max)(0, (int)std::floor(at.X * sc));
+        int top = (std::max)(0, (int)std::floor(at.Y * sc));
+        int right = (int)std::ceil((at.X + fe.ActualWidth()) * sc);
+        int bottom = (int)std::ceil((at.Y + fe.ActualHeight()) * sc);
+        if (right > left && bottom > top) out.push_back({left, top, right - left, bottom - top});
     };
     for (auto& st : t_titleBars)
         if (st.chrome && st.chrome.XamlRoot() == root)
@@ -8122,6 +8194,12 @@ static std::vector<winrt::Windows::Graphics::RectInt32> ArcHeaderButtons(const m
                 if (auto panel = FindByName(bar, name).try_as<muxc::Panel>())
                     for (auto const& child : panel.Children()) take(child.try_as<mux::FrameworkElement>());
         }
+    // The native sidebar logo also needs passthrough with the regular and Centered toolbars. Dia's
+    // caption region can cover it even though only Arc sidebar mode has an entry in t_arc.
+    if (auto header = FindInRoot(L"WindowDragHeader", root); header && header.IsLoaded() && ShownOnScreen(header)) {
+        auto logo = FindByName(header, L"AppMenuButton");
+        if (logo && logo.IsLoaded() && ShownOnScreen(logo)) take(logo);
+    }
     if (!ArcSidebarOn()) return out;
     for (auto& [h, st] : t_arc) {
         auto header = st.header.get();

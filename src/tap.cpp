@@ -655,7 +655,14 @@ static bool PointerAtTop(DWORD uiThread, bool shown) {
     HWND root = GetAncestor(w, GA_ROOT);
     DWORD pid = 0;
     DWORD tid = GetWindowThreadProcessId(root, &pid);
-    if (pid != GetCurrentProcessId() || tid != uiThread) return false;
+    if (pid != GetCurrentProcessId()) return false;
+    // Only Dia's own windows have a top edge. A context menu (or any other popup) opens with its top
+    // at the pointer, so measuring from it would reveal the toolbar on every right-click (#38). Over a
+    // popup, keep things as they are: a menu opened from the shown toolbar doesn't hide it.
+    wchar_t cls[64];
+    if (!GetClassNameW(root, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0)
+        return shown;
+    if (tid != uiThread) return false;
     POINT origin{0, 0};
     ClientToScreen(root, &origin);
     UINT dpi = GetDpiForWindow(root);

@@ -1502,6 +1502,7 @@ static thread_local std::map<std::pair<void*, void*>, LookSaved> t_look;
 static thread_local muxm::Brush t_lookText{nullptr};
 static thread_local bool t_lookPending = false;
 static thread_local winrt::event_token t_lookToken{};
+static void ScheduleAddressTextRefresh();
 
 // Toolbar in the title bar: the toolbar comes in the sidebar's colors (with Dia's site colors up there it
 // clashed, and the page's rounded top corners come with these). Off: Dia's own, adaptive colors.
@@ -1733,9 +1734,13 @@ static void LookField(const muxc::Border& bar) {
                 b.Background(over ? SidebarHoverBrush() : LookClear());
             }
         };
-        t_fieldHover[id].entered = bar.PointerEntered([hover](auto&&, auto&&) { hover(true); });
+        t_fieldHover[id].entered = bar.PointerEntered([hover](auto&&, auto&&) {
+            hover(true);
+            ScheduleAddressTextRefresh();
+        });
         t_fieldHover[id].exited = bar.PointerExited([hover](wf::IInspectable const& sender,
                                                            mux::Input::PointerRoutedEventArgs const& e) {
+            ScheduleAddressTextRefresh();
             auto b = sender.try_as<muxc::Border>();
             if (b) {
                 auto p = e.GetCurrentPoint(b).Position();
@@ -1895,6 +1900,91 @@ static bool LookInToolbar(mux::DependencyObject d) {
     return false;
 }
 
+// Dia can recolor individual address runs during a hover animation without changing
+// the text. Refresh through that transition instead of waiting for the periodic tick.
+static thread_local ULONGLONG t_addressRefreshUntil = 0;
+static thread_local winrt::event_token t_addressRefreshToken{};
+static thread_local bool t_addressRefreshPending = false;
+static void ScheduleAddressTextRefresh() {
+    if (!ToolbarSidebar() || Engine_TweakOn(L"arcUrlBar")) return;
+    t_addressRefreshUntil = GetTickCount64() + 400;
+    if (t_addressRefreshPending) return;
+    t_addressRefreshPending = true;
+    t_addressRefreshToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
+        if (!ToolbarSidebar() || Engine_TweakOn(L"arcUrlBar") || GetTickCount64() >= t_addressRefreshUntil) {
+            muxm::CompositionTarget::Rendering(t_addressRefreshToken);
+            t_addressRefreshPending = false;
+            return;
+        }
+        try {
+            for (auto h : FindNodes(L"AddressRichEditBox"))
+                if (auto box = Obj<muxc::RichEditBox>(h); box && LookInChrome(box)) LookAddressText(box);
+        } catch (...) {
+        }
+    });
+}
+
+// The page can receive wheel input in its own child window. Forward only wheel
+// notifications to the XAML thread; never consume the input or inspect its contents.
+static LowLevelHookThread g_addressWheelHook;
+static std::atomic<HWND> g_addressWheelWindow{nullptr};
+static std::atomic<bool> g_addressWheelPosted{false};
+static DWORD g_addressWheelThread = 0;
+static constexpr UINT WM_ADDRESS_WHEEL = WM_APP + 0x573;
+
+static LRESULT CALLBACK AddressWheelWindowProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    if (msg == WM_ADDRESS_WHEEL) {
+        g_addressWheelPosted = false;
+        try { ScheduleAddressTextRefresh(); } catch (...) {}
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static LRESULT CALLBACK AddressWheelProc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && (wp == WM_MOUSEWHEEL || wp == WM_MOUSEHWHEEL)) {
+        DWORD pid = 0;
+        GetWindowThreadProcessId(GetForegroundWindow(), &pid);
+        auto hwnd = g_addressWheelWindow.load();
+        if (pid == GetCurrentProcessId() && hwnd && !g_addressWheelPosted.exchange(true))
+            if (!PostMessageW(hwnd, WM_ADDRESS_WHEEL, 0, 0)) g_addressWheelPosted = false;
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+static void UpdateAddressWheelHook() {
+    bool on = ToolbarSidebar() && !Engine_TweakOn(L"arcUrlBar");
+    if (!g_addressWheelThread) {
+        if (!on) return;
+        bool hasField = false;
+        for (auto h : FindNodes(L"AddressRichEditBox"))
+            if (auto box = Obj<muxc::RichEditBox>(h); box && box.IsLoaded()) { hasField = true; break; }
+        if (!hasField) return;
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = AddressWheelWindowProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"DiaTweaksAddressWheel";
+        RegisterClassW(&wc);
+        auto hwnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+        if (!hwnd) return;
+        g_addressWheelWindow = hwnd;
+        g_addressWheelThread = GetCurrentThreadId();
+    }
+    if (GetCurrentThreadId() != g_addressWheelThread) return;
+    static bool failed = false;
+    if (!on) failed = false;
+    if (on == g_addressWheelHook.Running() || (on && failed)) return;
+    if (on) {
+        if (!g_addressWheelHook.Start(AddressWheelProc, nullptr)) {
+            failed = true;
+            Log("address wheel: hook failed %lu", g_addressWheelHook.Error());
+        }
+    } else {
+        g_addressWheelHook.Stop();
+        g_addressWheelPosted = false;
+    }
+}
+
 static void LookRestoreAll() {
     for (auto& [k, s] : t_look) {
         auto d = s.el.get();
@@ -1930,6 +2020,7 @@ static void LookWalk(const mux::DependencyObject& d, int depth) {
             hooked.push_back(winrt::make_weak(button));
             auto refresh = [](wf::IInspectable const& sender, auto&&) {
                 if (!ToolbarSidebar()) return;
+                ScheduleAddressTextRefresh();
                 auto owner = sender.try_as<muxc::Primitives::ButtonBase>();
                 if (owner && LookInToolbar(owner))
                     if (auto border = FindByName(owner, L"BackgroundBorder").try_as<muxc::Border>())
@@ -5647,7 +5738,7 @@ static void LayoutArcWin(ArcWinBar& b) {
         PutBack(b.hiddenBookmark);
         b.hiddenBookmark = {};
     }
-    if (hideBookmark) {
+    if (hideBookmark && (b.hiddenBookmark.dp || bookmark.Visibility() == mux::Visibility::Visible)) {
         if (!b.hiddenBookmark.dp) b.hiddenBookmark = SaveProp(bookmark, mux::UIElement::VisibilityProperty());
         if (bookmark.Visibility() != mux::Visibility::Collapsed) bookmark.Visibility(mux::Visibility::Collapsed);
     }
@@ -5686,7 +5777,9 @@ static void LayoutArcWin(ArcWinBar& b) {
     if (!pill.IsHitTestVisible()) pill.IsHitTestVisible(true);
     // Arc draws the site in its icon color.
     auto ref = FindByName(bar, L"ReloadButton").try_as<muxc::Control>();
-    auto fg = ref ? ref.Foreground() : reb ? reb.Foreground() : label.Foreground();
+    // In the title bar, use the sidebar color directly: Dia can briefly recolor
+    // the reload button on hover before the toolbar look restores its foreground.
+    auto fg = ToolbarSidebar() ? SidebarTextBrush() : ref ? ref.Foreground() : reb ? reb.Foreground() : label.Foreground();
     if (label.Foreground() != fg) label.Foreground(fg);
 
     // Dia's page buttons that are showing: the first goes before the site, the rest after it.
@@ -5721,7 +5814,8 @@ static void LayoutArcWin(ArcWinBar& b) {
         fieldL = (std::max)(fieldL, (double)left.TransformToVisual(bar).TransformPoint({0, 0}).X + left.ActualWidth());
     if (auto right = FindByName(bar, L"diatweaksArcWinRight"); right && right.ActualWidth() > 0)
         fieldR = (std::min)(fieldR, (double)right.TransformToVisual(bar).TransformPoint({0, 0}).X);
-    for (size_t i = 0; i < buttons.size(); i++) (i == 0 ? leftW : rightW) += buttons[i].ActualWidth() + gap;
+    for (auto& button : buttons)
+        (button == bookmark ? leftW : rightW) += button.ActualWidth() + gap;
 
     label.Measure({std::numeric_limits<float>::infinity(), std::numeric_limits<float>::infinity()});
     auto lm = label.Margin();  // (DesiredSize includes it)
@@ -5765,9 +5859,12 @@ static void LayoutArcWin(ArcWinBar& b) {
         if (b.spaced) {
             uint32_t first, current;
             bool present = b.spaced.Children().IndexOf(b.siteGap, current);
-            if (b.spaced.Children().IndexOf(buttons[0], first) && (!present || current != first + 1)) {
+            bool firstIsBookmark = buttons[0] == bookmark;
+            if (b.spaced.Children().IndexOf(buttons[0], first) &&
+                (!present || (firstIsBookmark ? current != first + 1 : current + 1 != first))) {
                 if (present) b.spaced.Children().RemoveAt(current);
-                if (b.spaced.Children().IndexOf(buttons[0], first)) b.spaced.Children().InsertAt(first + 1, b.siteGap);
+                if (b.spaced.Children().IndexOf(buttons[0], first))
+                    b.spaced.Children().InsertAt(first + (firstIsBookmark ? 1 : 0), b.siteGap);
             }
             if (b.spaced.Spacing() != gap) b.spaced.Spacing(gap);
             if (b.siteGap.Width() != w + 2 * pad) b.siteGap.Width(w + 2 * pad);
@@ -5803,13 +5900,16 @@ static void LayoutArcWin(ArcWinBar& b) {
         }
         if (auto clip = host.Clip()) {
             double hx = host.TransformToVisual(bar).TransformPoint({0, 0}).X;
+            double left = x - hx - 2, right = left + group + 4;
             double top = 0, bottom = host.ActualHeight();
             if (trailing && trailing.ActualHeight() > 0) {
-                double y = trailing.TransformToVisual(host).TransformPoint({0, 0}).Y;
-                top = (std::min)(top, y);
-                bottom = (std::max)(bottom, y + trailing.ActualHeight());
+                auto at = trailing.TransformToVisual(host).TransformPoint({0, 0});
+                left = (std::min)(left, (double)at.X);
+                right = (std::max)(right, (double)at.X + trailing.ActualWidth());
+                top = (std::min)(top, (double)at.Y);
+                bottom = (std::max)(bottom, (double)at.Y + trailing.ActualHeight());
             }
-            winrt::Windows::Foundation::Rect r{(float)(x - hx - 2), (float)top, (float)(group + 4), (float)(bottom - top)};
+            winrt::Windows::Foundation::Rect r{(float)left, (float)top, (float)(right - left), (float)(bottom - top)};
             auto cur = clip.Rect();
             if (std::abs(cur.X - r.X) > 0.5 || std::abs(cur.Y - r.Y) > 0.5 ||
                 std::abs(cur.Width - r.Width) > 0.5 || std::abs(cur.Height - r.Height) > 0.5)
@@ -6807,9 +6907,9 @@ static void CompactTitleBar(TitleBarState& st) {
     auto bar = st.bar.get();
     if (!bar) { RestoreTitleCompact(st); return; }
     double height = ToolbarHeightChoice();
-    // Dia's native button templates need 32 px even in the 32 px row. Shrinking the
-    // control clips templates whose inner content retains its native height.
-    double controlHeight = 32;
+    // Match the compact toolbar in its native pane, with two pixels above and below.
+    double controlHeight = (std::min)(32.0, height - 4);
+    double hoverHeight = controlHeight;
     auto row = st.host.RowDefinitions().GetAt(0);
     if (row.MinHeight() > height) row.MinHeight(height);
     if (row.MaxHeight() != height) row.MaxHeight(height);
@@ -6824,14 +6924,39 @@ static void CompactTitleBar(TitleBarState& st) {
         TitleSet(st, fe, mux::FrameworkElement::MaxHeightProperty(), winrt::box_value(height));
     };
     size(bar, height);
+    if (auto navigation = FindByName(bar, L"NavigationBarContent").try_as<muxc::Grid>()) {
+        auto padding = navigation.Padding();
+        TitleSet(st, navigation, muxc::Grid::PaddingProperty(),
+                 winrt::box_value(mux::Thickness{padding.Left, 0, padding.Right, 0}));
+    }
+    // Keep the address host's layout slot the same height as the controls.
+    if (auto address = FindByName(bar, L"AssistantBarHost"))
+        if (auto slot = muxm::VisualTreeHelper::GetParent(address).try_as<muxc::Grid>()) {
+            size(slot, controlHeight);
+            TitleSet(st, slot, mux::FrameworkElement::VerticalAlignmentProperty(),
+                     winrt::box_value(mux::VerticalAlignment::Center));
+        }
     for (auto name : {L"NavigationBarContent", L"diatweaksArcWinStrip", L"diatweaksArcWinPill", L"AssistantBarHost", L"AssistantBar", L"TitleGrid", L"UrlBarHitTarget"}) {
         auto fe = FindByName(bar, name);
         if (!fe) continue;
-        size(fe, std::wstring_view(name) == L"NavigationBarContent" ? height : controlHeight);
-        auto m = fe.Margin();
-        TitleSet(st, fe, mux::FrameworkElement::MarginProperty(), winrt::box_value(mux::Thickness{m.Left, 0, m.Right, 0}));
+        auto elementName = std::wstring_view(name);
+        size(fe, elementName == L"NavigationBarContent" ? height :
+                 elementName == L"diatweaksArcWinPill" ? hoverHeight : controlHeight);
+        // The centered URL layout owns the pill's margin and changes it as the site changes.
+        if (elementName != L"diatweaksArcWinPill") {
+            auto m = fe.Margin();
+            TitleSet(st, fe, mux::FrameworkElement::MarginProperty(), winrt::box_value(mux::Thickness{m.Left, 0, m.Right, 0}));
+        }
         TitleSet(st, fe, mux::FrameworkElement::VerticalAlignmentProperty(), winrt::box_value(mux::VerticalAlignment::Center));
     }
+    if (height == 32 && !Engine_TweakOn(L"arcUrlBar"))
+        if (auto editor = FindByName(bar, L"AddressRichEditBox"))
+            if (auto offset = editor.RenderTransform().try_as<muxm::TranslateTransform>(); offset && std::abs(offset.Y()) > 0.1) {
+                muxm::TranslateTransform centered;
+                centered.X(offset.X());
+                centered.Y(0);
+                TitleSet(st, editor, mux::UIElement::RenderTransformProperty(), centered);
+            }
     std::function<void(const mux::DependencyObject&)> buttons = [&](const mux::DependencyObject& parent) {
         if (auto button = parent.try_as<muxc::Button>()) {
             size(button, controlHeight);
@@ -6839,7 +6964,7 @@ static void CompactTitleBar(TitleBarState& st) {
             if (auto root = FindVisual(button, [](const mux::DependencyObject& d) { return (bool)d.try_as<muxc::Grid>(); }).try_as<muxc::Grid>())
                 TitleSet(st, root, muxc::Grid::CornerRadiusProperty(), winrt::box_value(mux::CornerRadius{6, 6, 6, 6}));
             if (auto background = FindByName(button, L"BackgroundBorder")) {
-                size(background, controlHeight);
+                size(background, hoverHeight);
                 TitleSet(st, background, muxc::Border::CornerRadiusProperty(), winrt::box_value(mux::CornerRadius{6, 6, 6, 6}));
                 auto margin = background.Margin();
                 TitleSet(st, background, mux::FrameworkElement::MarginProperty(),
@@ -8791,6 +8916,7 @@ bool Ui_Tick() {
     const char* stage = "states";  // which step failed, for the log
     try {
         if (tick % 2 == 0) changed = UpdateStates();
+        UpdateAddressWheelHook();
         stage = "arc";
         UpdateAddressBars();
         stage = "startPages";

@@ -4464,7 +4464,8 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
     auto host = FindByName(url, L"AssistantBarHost");
     auto trailing = host ? FindByName(host, L"UrlBarTrailingStack") : nullptr;
     if (!trailing) return;
-    if (st.trailing != trailing) {
+    bool newTrailing = st.trailing != trailing;
+    if (newTrailing) {
         PutBack(st.trailingHit);
         PutBack(st.trailingOpacity);
         st.trailing = trailing;
@@ -4474,11 +4475,11 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
     if (trailing.Opacity() != 1) trailing.Opacity(1);  // Dia's own hover binding; ours drives the fade
     bool show = st.hover;
     trailing.IsHitTestVisible(show);
-    if (show == st.trailingShown && animate) return;
+    if (show == st.trailingShown && animate && !newTrailing) return;
     st.trailingShown = show;
     try {
         auto v = winrt::Microsoft::UI::Xaml::Hosting::ElementCompositionPreview::GetElementVisual(trailing);
-        if (!animate) {
+        if (!animate || newTrailing) {
             v.StopAnimation(L"Opacity");
             v.Opacity(show ? 1.0f : 0.0f);
             return;
@@ -6628,7 +6629,9 @@ static void CompactTitleBar(TitleBarState& st) {
     auto bar = st.bar.get();
     if (!bar) { RestoreTitleCompact(st); return; }
     double height = ToolbarHeightChoice();
-    double controlHeight = (std::min)(32.0, height - 4);
+    // Dia's native button templates need 32 px even in the 32 px row. Shrinking the
+    // control clips templates whose inner content retains its native height.
+    double controlHeight = 32;
     auto row = st.host.RowDefinitions().GetAt(0);
     if (row.MinHeight() > height) row.MinHeight(height);
     if (row.MaxHeight() != height) row.MaxHeight(height);
@@ -8549,6 +8552,53 @@ static void UpdateChatButtonHover() {
     }
 }
 
+// Dia uses the same hover color for the native address field and its buttons. When
+// those colors coincide, give the hovered button a contrasting shade of that color.
+struct AddressButtonHover {
+    winrt::weak_ref<muxc::Button> button;
+    winrt::weak_ref<muxc::Border> border;
+    SavedProp background;
+    muxm::SolidColorBrush fill{nullptr};
+};
+static thread_local std::vector<AddressButtonHover> t_addressButtonHover;
+
+static void UpdateAddressButtonHover() {
+    for (auto it = t_addressButtonHover.begin(); it != t_addressButtonHover.end();) {
+        auto button = it->button.get();
+        auto border = it->border.get();
+        if (!button || !border || !button.IsPointerOver() || Engine_TweakOn(L"arcUrlBar") || TitleBarOn()) {
+            PutBack(it->background);
+            it = t_addressButtonHover.erase(it);
+        } else {
+            if (border.Background() != it->fill) border.Background(it->fill);
+            ++it;
+        }
+    }
+    if (Engine_TweakOn(L"arcUrlBar") || TitleBarOn()) return;
+    for (auto name : {L"BookmarkButton", L"SiteMenuButton"})
+        for (auto h : FindNodes(name)) {
+            auto button = Obj<muxc::Button>(h);
+            if (!button || !button.IsPointerOver()) continue;
+            if (std::any_of(t_addressButtonHover.begin(), t_addressButtonHover.end(),
+                            [&](auto& s) { return s.button.get() == button; })) continue;
+            auto border = FindByName(button, L"BackgroundBorder").try_as<muxc::Border>();
+            muxc::Border field{nullptr};
+            for (auto p = muxm::VisualTreeHelper::GetParent(button); p; p = muxm::VisualTreeHelper::GetParent(p))
+                if (auto fe = p.try_as<muxc::Border>(); fe && fe.Name() == L"AssistantBar") { field = fe; break; }
+            auto fieldBrush = field ? field.Background().try_as<muxm::SolidColorBrush>() : nullptr;
+            auto buttonBrush = border ? border.Background().try_as<muxm::SolidColorBrush>() : nullptr;
+            if (!fieldBrush || !buttonBrush || fieldBrush.Color().A != 255 || fieldBrush.Color() != buttonBrush.Color()) continue;
+            auto color = fieldBrush.Color();
+            int delta = (int(color.R) * 299 + int(color.G) * 587 + int(color.B) * 114 < 128000) ? 32 : -32;
+            auto shift = [delta](uint8_t c) { return static_cast<uint8_t>((std::clamp)(int(c) + delta, 0, 255)); };
+            color.R = shift(color.R); color.G = shift(color.G); color.B = shift(color.B);
+            AddressButtonHover state{winrt::make_weak(button), winrt::make_weak(border),
+                                     SaveProp(border, muxc::Border::BackgroundProperty()), muxm::SolidColorBrush(color)};
+            border.Background(state.fill);
+            t_addressButtonHover.push_back(std::move(state));
+        }
+}
+
 bool Ui_Tick() {
     static thread_local int tick = 0;
     tick++;
@@ -8567,6 +8617,7 @@ bool Ui_Tick() {
         StyleStartPages();
         stage = "hiddenToolbar";
         UpdateHiddenToolbar();
+        UpdateAddressButtonHover();
         stage = "titleBar";
         // Guarded on its own: a failure here must not skip the rest of the tick (settings among them, where
         // the patch is switched off).

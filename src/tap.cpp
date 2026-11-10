@@ -669,6 +669,11 @@ static bool PointerAtTop(DWORD uiThread, bool shown) {
         root = GetAncestor(w, GA_ROOT);
         DWORD pid = 0;
         DWORD tid = GetWindowThreadProcessId(root, &pid);
+        if (pid == GetCurrentProcessId()) {
+            wchar_t cls[64];
+            if (!GetClassNameW(root, cls, ARRAYSIZE(cls)) || wcscmp(cls, L"WinUIDesktopWin32WindowClass") != 0)
+                return shown;  // a Dia popup is not the window's reveal edge
+        }
         if (pid != GetCurrentProcessId() || tid != uiThread) root = nullptr;
     }
     bool past = false;  // over something else, just above the window the toolbar is out in

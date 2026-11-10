@@ -79,17 +79,24 @@ bool Ui_PeekFixedSize(HWND w);
 // Peek "open as tab": where a window's tab row is (screen pixels), and, with its tab menu open, Dia's
 // "Move to Window" to the window `to` (1 done, 0 menu not open yet, -1 can't).
 bool Ui_PeekTabRow(HWND win, RECT& out);
+std::wstring Ui_PeekTabInfo(HWND win);  // (for the log: the window's title and its tab list's labels)
+std::wstring Ui_PeekMenuInfo(HWND win);  // (for the log: the menus open in the window, and their items)
 int Ui_PeekMoveTab(HWND win, HWND to);
 // Peek's split: `win`'s tab titled `title` opened as a split beside the tab it's on (1 done, 0 not yet, -1 can't).
 int Ui_PeekSplitWith(HWND win, const std::wstring& title);
 bool Ui_PeekTabRowNamed(HWND win, const std::wstring& title, RECT& out);
 bool Ui_PeekShowTabMenu(HWND window);
+bool Ui_PeekMenuOpen(HWND win);  // a menu (or any popup) open on the preview's window
 void Ui_PeekCloseTabMenu(HWND window);
 void Peek_BeforeMove();  // (peek.cpp: just before the tab moves)
 
 // ---- provided by history.cpp (Hide history suggestions)
 // Runs every timer tick on each UI thread.
 void History_Tick();
+
+// ---- provided by media.cpp (Media Controls: a card for tabs playing in the background)
+// Runs every timer tick on each UI thread.
+void Media_Tick();
 
 // ---- provided by peek.cpp (the Peek tweak: hold on a link to preview it)
 // Runs every timer tick on each UI thread.

@@ -55,6 +55,7 @@
 #include <audioclient.h>
 
 #include "engine.h"
+#include "llhook.h"
 
 namespace wf = winrt::Windows::Foundation;
 namespace mux = winrt::Microsoft::UI::Xaml;
@@ -318,6 +319,11 @@ static void RunProbe() {
         if (nm == L"TIDYPOST" || nm == L"TIDYSTATE") {  // posts the prompt to the parked chat / reports it
             extern std::string Tidy_DebugSend(bool post);
             o << Tidy_DebugSend(nm == L"TIDYPOST") << "\n";
+            continue;
+        }
+        if (nm == L"COLORS") {  // colorful brushes in use, and where (finding Dia's profile color)
+            extern std::string Media_DebugColors();
+            o << Media_DebugColors();
             continue;
         }
         if (nm == L"FLYOUTS") {  // elements with a right-click menu, and what's in them
@@ -701,17 +707,17 @@ static void ApplyPreset(const std::wstring& preset) {
     std::vector<std::pair<std::wstring, std::wstring>> values{{L"preset", preset}};
     if (preset == L"custom") return Engine_SetMany({}, values);  // keep the patches as they are
     // Arc: the page fills the window with straight edges, the toolbar lives in the sidebar, Ctrl+T
-    // floats, no tab hover cards, an acrylic window, and Peek.
+    // floats, no tab hover cards, an acrylic window, Peek, and media controls at the bottom of the sidebar.
     static const std::set<std::wstring> arc = {L"edgeToEdge",     L"squareCorners",       L"hideToolbar",
                                                L"arcUrlBar",      L"floatingNewTab",      L"hideTabSearchButton",
                                                L"hideChatButton", L"hideTabHoverCard",    L"windowMaterial",
-                                               L"peek",           L"tidyTabs"};
+                                               L"peek",           L"tidyTabs", L"mediaControls"};
     // Arc (Windows): the same, but like Arc for Windows the toolbar stays, up in the title bar in the sidebar's
     // color (Toolbar in the title bar), with the site centered in it (the Centered address bar).
     static const std::set<std::wstring> arcWindows = {L"edgeToEdge",       L"squareCorners",    L"arcUrlBar",        L"titleBar",
                                                       L"floatingNewTab",   L"hideTabSearchButton", L"hideChatButton",
                                                       L"hideTabHoverCard", L"windowMaterial",   L"peek",
-                                                      L"tidyTabs"};
+                                                      L"tidyTabs",         L"mediaControls"};
     bool isArc = preset == L"arc", isArcWindows = preset == L"arcWindows";
     std::vector<std::pair<std::wstring, bool>> states;
     for (auto& t : Engine_Tweaks())
@@ -4307,6 +4313,9 @@ struct ArcState {
     // sidebar header (Dia's), put back when it goes home; whether it's up there; given up if XAML refused.
     std::vector<SavedProp> spaceSaved;
     bool spaceUp = false, spaceFailed = false;
+    // ☆ / ⋯ moved so ⋯ sits flush in the pill's corner: the stack, and Dia's own RenderTransform for it.
+    winrt::weak_ref<mux::UIElement> flushed;
+    muxm::Transform flushedTransform{nullptr};
 };
 static thread_local std::map<InstanceHandle, ArcState> t_arc;
 
@@ -4355,6 +4364,9 @@ static void ReturnMoved(ArcState& st) {
     for (auto& [w, dp, v] : st.iconTint)
         if (auto o = w.get()) o.SetValue(dp, v);
     st.iconTint.clear();
+    if (auto f = st.flushed.get()) f.RenderTransform(st.flushedTransform);
+    st.flushed = nullptr;
+    st.flushedTransform = nullptr;
     st.trailingShown = true;
     RestoreAddress(st.display);
     for (auto it = st.moved.rbegin(); it != st.moved.rend(); ++it) {
@@ -4433,29 +4445,23 @@ static void ArcOff(ArcState& st) {
 }
 
 // Keeps the pill's label in step with Dia's address text and clear of the ☆ / ⋯ buttons.
-// Is the mouse pointer over this element right now (and over its window, not something on top)?
-static bool PointerInside(const mux::FrameworkElement& el) {
+// Has the mouse pointer left this element's window for another app (or the desktop)? Inside Dia's own
+// windows XAML's pointer events track hover exactly (see TrackArcPointer); this only catches a leave
+// they missed. It never decides from screen coordinates: converting those to XAML's got it wrong while
+// the pointer was on the pill, which hid the ☆ / ⋯ buttons (and cancelled a click mid-press).
+static bool PointerLeftWindow(const mux::FrameworkElement& el) {
     POINT pt;
-    if (!el) return false;
-    auto xamlRoot = el.XamlRoot();
-    if (!xamlRoot || !GetCursorPos(&pt)) return false;
+    if (!el || !el.XamlRoot() || !GetCursorPos(&pt)) return false;
     HWND under = WindowFromPoint(pt);
     HWND root = under ? GetAncestor(under, GA_ROOT) : nullptr;
     DWORD pid = 0;
-    if (!root || (GetWindowThreadProcessId(root, &pid), pid) != GetCurrentProcessId()) return false;
-    try {
-        auto environment = xamlRoot.ContentIslandEnvironment();
-        if (!environment) return false;
-        auto id = environment.AppWindowId();
-        if ((HWND)(uintptr_t)id.Value != root) return false;
-    } catch (...) {
-    }
-    ScreenToClient(root, &pt);
-    double scale = xamlRoot.RasterizationScale();
-    double x = pt.x / scale, y = pt.y / scale;
-    auto o = el.TransformToVisual(nullptr).TransformPoint({0, 0});
-    return x >= o.X && y >= o.Y && x < o.X + el.ActualWidth() && y < o.Y + el.ActualHeight();
+    if (root) GetWindowThreadProcessId(root, &pid);
+    return pid != GetCurrentProcessId();  // our popups (menus, tooltips) count as still inside
 }
+
+// Pointer moves anywhere in the window (handled ones too): hover follows them, so a leave (or an
+// enter) the pill's own events missed, e.g. while Dia moved its controls in, is caught on the next move.
+static void TrackArcPointer(const mux::FrameworkElement& el);
 
 // ☆ / ⋯ fade in while the pointer is over the pill and out when it leaves (Arc's clean pill).
 static void UpdateArcTrailing(ArcState& st, bool animate) {
@@ -4489,6 +4495,50 @@ static void UpdateArcTrailing(ArcState& st, bool animate) {
         fade.InsertKeyFrame(1.0f, show ? 1.0f : 0.0f);
         fade.Duration(std::chrono::milliseconds(show ? 120 : 180));
         v.StartAnimation(L"Opacity", fade);
+    } catch (...) {
+    }
+}
+
+// ☆ / ⋯ flush with the pill: Dia lays them out for its toolbar, which leaves ⋯ off-center in the pill
+// (touching the bottom, a gap above and a wider one on the right). Move the pair so ⋯ keeps the same
+// small inset from the top, bottom and right edges, with corners that follow the pill's.
+static void FlushArcTrailing(ArcState& st) {
+    auto url = st.url.get().try_as<mux::FrameworkElement>();
+    auto host = url ? FindByName(url, L"AssistantBarHost") : nullptr;
+    auto trailing = host ? FindByName(host, L"UrlBarTrailingStack").try_as<muxc::Panel>() : nullptr;
+    if (!trailing || url.ActualHeight() <= 0) return;
+    muxc::Button last{nullptr};
+    std::vector<muxc::Button> buttons;
+    for (auto const& c : trailing.Children())
+        if (auto b = c.try_as<muxc::Button>(); b && b.Visibility() == mux::Visibility::Visible && b.ActualWidth() > 0)
+            buttons.push_back(b), last = b;
+    if (!last) return;
+    if (st.flushed.get() != trailing) {
+        if (auto old = st.flushed.get()) old.RenderTransform(st.flushedTransform);
+        st.flushed = winrt::make_weak(trailing.as<mux::UIElement>());
+        st.flushedTransform = trailing.RenderTransform();
+    }
+    auto shift = trailing.RenderTransform().try_as<muxm::TranslateTransform>();
+    if (!shift || shift == st.flushedTransform) shift = muxm::TranslateTransform{}, trailing.RenderTransform(shift);
+    try {
+        auto bg = FindByName(last, L"BackgroundBorder");
+        mux::FrameworkElement box = bg && bg.ActualHeight() > 0 ? bg : last.as<mux::FrameworkElement>();
+        auto r = box.TransformToVisual(url).TransformBounds({0, 0, (float)box.ActualWidth(), (float)box.ActualHeight()});
+        double inset = (std::max)(0.0, (url.ActualHeight() - r.Height) / 2);
+        double dx = (url.ActualWidth() - inset) - (r.X + r.Width), dy = inset - r.Y;
+        if (std::abs(dx) > 0.25) shift.X(shift.X() + dx);
+        if (std::abs(dy) > 0.25) shift.Y(shift.Y() + dy);
+        // Concentric corners: the pill's radius less the gap.
+        double radius = (std::max)(4.0, url.as<muxc::Grid>().CornerRadius().TopRight - inset);
+        for (auto& b : buttons)
+            if (std::abs(b.CornerRadius().TopRight - radius) > 0.1) {
+                bool known = false;
+                for (auto& [w, dp, v] : st.iconTint)
+                    if (dp == muxc::Control::CornerRadiusProperty() && w.get() == b) known = true;
+                if (!known) st.iconTint.push_back({winrt::make_weak(b.as<mux::DependencyObject>()), muxc::Control::CornerRadiusProperty(),
+                                                   b.ReadLocalValue(muxc::Control::CornerRadiusProperty())});
+                b.CornerRadius({radius, radius, radius, radius});
+            }
     } catch (...) {
     }
 }
@@ -4613,10 +4663,13 @@ static void ArcStyleHeader(ArcState& st) {
         auto c = el.Margin();
         if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Top - m.Top) > 0.1 || std::abs(c.Right - m.Right) > 0.1) el.Margin(m);
     }
+    double leftEnd = logoX + logo.ActualWidth() + (left.Visibility() == mux::Visibility::Visible ? left.ActualWidth() : 0);
+    double contentStart = leftEnd;  // where Dia's profile / space name may begin
     // Profile emoji patch: right after the sidebar button, on the same line (it would sit under it).
     for (auto const& c : header.Children())
         if (auto em = c.try_as<muxc::TextBlock>(); em && em.Name() == L"diatweaksProfileEmoji") {
-            double x = logoX + logo.ActualWidth() + (left.Visibility() == mux::Visibility::Visible ? left.ActualWidth() : 0) + 6;
+            double x = leftEnd + 6;
+            if (em.Visibility() == mux::Visibility::Visible) contentStart = x + em.ActualWidth() + 2;
             // Same visual size as the icons; color emoji glyphs sit low in their line box, so lift it.
             if (em.FontSize() != 14) HeaderSet(st, em, muxc::TextBlock::FontSizeProperty(), winrt::box_value(14.0));
             double y = top + (std::max)(0.0, (32 - em.ActualHeight()) / 2) - 1.5;
@@ -4628,6 +4681,27 @@ static void ArcStyleHeader(ArcState& st) {
             if (std::abs(m.Left - x) > 0.1 || std::abs(m.Top - y) > 0.1)
                 HeaderSet(st, em, mux::FrameworkElement::MarginProperty(), winrt::box_value(mux::Thickness{x, y, 0, 0}));
         }
+    // With more than one profile Dia shows its name (the space switcher) in the middle column, which
+    // starts where the sidebar button now sits: move it past that button, and keep it off ← → ↻.
+    if (auto host = FindByName(header, L"HeaderContentHost"); host && cols >= 3) {
+        auto defs = header.ColumnDefinitions();
+        double colStart = defs.GetAt(0).ActualWidth();
+        double colEnd = header.ActualWidth() - defs.GetAt(cols - 1).ActualWidth();
+        double rightStart = right.Visibility() == mux::Visibility::Visible ? header.ActualWidth() - edge - right.ActualWidth() : colEnd;
+        // Dia centers the name a little above the icons' line: shift it (top and bottom alike, so its
+        // height stays the same) until its middle meets the icons' middle.
+        auto c = host.Margin();
+        double dy = c.Top;
+        if (auto title = FindByName(host, L"TitleTextPresenter"); title && title.ActualHeight() > 0)
+            try {
+                double y = title.TransformToVisual(header).TransformPoint({0, 0}).Y - c.Top;
+                dy = top + 16 - (y + title.ActualHeight() / 2) - 0.6;  // capitals sit a bit below their line's middle
+            } catch (...) {
+            }
+        mux::Thickness m{(std::max)(0.0, contentStart - colStart), dy, (std::max)(0.0, colEnd - rightStart + 4), -dy};
+        if (std::abs(c.Left - m.Left) > 0.1 || std::abs(c.Right - m.Right) > 0.1 || std::abs(c.Top - m.Top) > 0.1)
+            HeaderSet(st, host, mux::FrameworkElement::MarginProperty(), winrt::box_value(m));
+    }
     // (The Dia logo keeps Dia's own look: repainted in the icons' color it was a solid white blob.)
 }
 
@@ -5383,8 +5457,12 @@ static void UpdateArcBar() {
             BuildArcRows(st, paging);
         }
         AdoptActiveTab(st);
-        if (auto u = st.url.get().try_as<mux::FrameworkElement>()) st.hover = PointerInside(u);  // events can miss a leave
+        if (auto u = st.url.get().try_as<mux::FrameworkElement>()) {
+            TrackArcPointer(u);
+            if (st.hover && PointerLeftWindow(u)) st.hover = false;  // events can miss a leave
+        }
         UpdateArcTrailing(st, !st.swapped);
+        FlushArcTrailing(st);
         UpdateArcLabel(st);
         ArcStyleHeader(st);
         if (st.swapped) st.swapped = false, UpdateAddressField();
@@ -5985,6 +6063,45 @@ static void HookArcWinHover(const mux::FrameworkElement& host) {
     host.PointerExited([update](wf::IInspectable const& s, mux::Input::PointerRoutedEventArgs const& e) { update(s, e, true); });
 }
 
+static bool InBounds(const mux::FrameworkElement& el, mux::Input::PointerRoutedEventArgs const& e) {
+    if (!el || el.Visibility() != mux::Visibility::Visible) return false;
+    auto p = e.GetCurrentPoint(el).Position();
+    return p.X >= 0 && p.Y >= 0 && p.X < el.ActualWidth() && p.Y < el.ActualHeight();
+}
+
+static void TrackArcPointer(const mux::FrameworkElement& el) {
+    static thread_local std::set<void*> hooked;
+    auto xr = el ? el.XamlRoot() : nullptr;
+    auto content = xr ? xr.Content() : nullptr;
+    if (!content || !hooked.insert(winrt::get_abi(content)).second) return;
+    content.AddHandler(
+        mux::UIElement::PointerMovedEvent(),
+        winrt::box_value(mux::Input::PointerEventHandler([](wf::IInspectable const& sender, mux::Input::PointerRoutedEventArgs const& e) {
+            auto root = sender.try_as<mux::UIElement>();
+            auto xr = root ? root.XamlRoot() : nullptr;
+            if (!xr) return;
+            try {
+                for (auto& [h, st] : t_arc) {
+                    auto u = st.url.get().try_as<mux::FrameworkElement>();
+                    if (!u || u.XamlRoot() != xr) continue;
+                    bool in = InBounds(u, e);
+                    if (in != st.hover) st.hover = in, UpdateArcTrailing(st, true), UpdateArcLabel(st);
+                }
+                for (auto& [h, x] : t_arcWin) {
+                    auto pill = x.pill.get();
+                    if (!pill || pill.XamlRoot() != xr) continue;
+                    bool in = InBounds(pill, e);
+                    if (in != x.hover) {
+                        x.hover = in;
+                        LayoutArcWinSafe([pill](const ArcWinBar& b) { return b.pill.get() == pill; });
+                    }
+                }
+            } catch (...) {
+            }
+        })),
+        true);
+}
+
 static bool NewTabRelayActive();
 
 // Tabs' own toolbars other than the one under the strip: Dia shows a new tab's toolbar the moment it
@@ -6063,7 +6180,11 @@ static void UpdateArcWindows() {
         }
         PlaceArcWinStrip(b);
         auto host = FindByName(bar, L"AssistantBarHost");
-        if (b.hover && !(b.pill.get() && PointerInside(b.pill.get()))) b.hover = false;  // events can miss a leave
+        if (auto pill = b.pill.get()) {
+            TrackArcPointer(pill);
+            if (b.hover && PointerLeftWindow(pill)) b.hover = false;  // events can miss a leave
+        } else
+            b.hover = false;
         LayoutArcWin(b);
     }
     for (auto it = t_arcWin.begin(); it != t_arcWin.end();)
@@ -6171,13 +6292,20 @@ static void StyleStartPages() {
 
 static thread_local bool t_newTabMode = false;
 static bool InNewTabMode() { return t_newTabMode; }
-static thread_local bool t_passCtrlT = false;     // let our own Ctrl+T through to Dia once
+// Read by the key hook, on its own thread (see ArcKeyHook):
+static std::atomic<bool> g_arcPassCtrlT{false};     // let our own Ctrl+T through to Dia once
+static std::atomic<bool> g_arcEnterSubmits{false};  // new-tab mode, its box focused: Enter opens a new tab
 static thread_local std::wstring t_pendingQuery;  // text to submit in the new tab
-static thread_local int t_submitFrames = 0;
 static thread_local winrt::event_token t_submitToken{};
-static thread_local int t_enterIn = -1;  // frames until Enter, after the text was typed
+// The relay's steps, timed in ms (not frames: a frame is 4 ms on a 240 Hz screen and 17 ms on 60 Hz,
+// and none are drawn while Dia is busy).
+enum class Relay { WaitBox, WaitText, Verify };
+static thread_local Relay t_relayStep = Relay::WaitBox;
+static thread_local double t_relayDeadline = 0;  // give up after this
+static thread_local double t_relayAt = 0;        // when the text showed up / Enter was last pressed
+static thread_local int t_enterTries = 0;
 static thread_local std::wstring t_typedQuery;  // what we typed, to know when Dia has it
-static thread_local int t_settle = -1;          // frames to wait once Dia has the text
+static thread_local winrt::weak_ref<muxc::RichEditBox> t_relayBox;  // the new tab's box we typed into
 static thread_local winrt::weak_ref<mux::UIElement> t_hiddenPage;  // the New Tab page, hidden during the relay
 static thread_local int t_unhideFrames = 0;
 static thread_local winrt::event_token t_unhideToken{};
@@ -6246,6 +6374,7 @@ static void StartNewTabMode() {
         bool done = --t_clearFrames <= 0;
         if (auto q = FocusedQueryBox()) {
             if (auto reb = q.try_as<muxc::RichEditBox>()) reb.Document().SetText(winrt::Microsoft::UI::Text::TextSetOptions::None, L"");
+            g_arcEnterSubmits = t_newTabMode;
             done = true;
         }
         if (done) {
@@ -6282,6 +6411,7 @@ static void SubmitInNewTab() {
     std::wstring text(raw);
     while (!text.empty() && iswspace(text.back())) text.pop_back();
     t_newTabMode = false;
+    g_arcEnterSubmits = false;
     SendKeys({{VK_ESCAPE, true}, {VK_ESCAPE, false}});
     if (text.empty()) return;
     OpenTextInNewTab(text);
@@ -6292,74 +6422,99 @@ static void OpenTextInNewTab(const std::wstring& text) {
     t_pendingQuery = text;
     t_relayText = text;
     if (ArcWindowsOn()) LayoutArcWinSafe([](const ArcWinBar&) { return true; });  // the new address, now
-    t_passCtrlT = true;
+    g_arcPassCtrlT = true;
     bool ctrlHeld = GetAsyncKeyState(VK_CONTROL) & 0x8000;
     if (ctrlHeld) SendKeys({{'T', true}, {'T', false}});
     else SendKeys({{VK_CONTROL, true}, {'T', true}, {'T', false}, {VK_CONTROL, false}});
     // Wait for the new tab's box to take focus, then fill it and press Enter.
-    t_submitFrames = 180;
+    t_relayStep = Relay::WaitBox;
+    t_relayDeadline = NowMs() + 3000;
     if (t_submitToken) return;
     t_submitToken = muxm::CompositionTarget::Rendering([](auto&&, auto&&) {
-        bool done = --t_submitFrames <= 0;
-        if (t_enterIn > 0) {
-            // Enter only works once Dia's own query has the text (it reads it a moment after the box
-            // shows it): wait for the box to hold exactly what we typed, then a few frames more.
-            if (t_settle < 0) {
-                if (auto box = FocusedNewTabBox()) {
-                    winrt::hstring raw;
-                    box.Document().GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, raw);
-                    std::wstring cur(raw);
-                    while (!cur.empty() && iswspace(cur.back())) cur.pop_back();
-                    if (cur.rfind(t_typedQuery, 0) == 0) t_settle = 8;  // (Dia may add autocomplete after it)
+        double now = NowMs();
+        bool done = now >= t_relayDeadline;
+        // The box still holds what we typed (Dia may add autocomplete after it).
+        auto holdsText = [](const muxc::RichEditBox& box) {
+            winrt::hstring raw;
+            box.Document().GetText(winrt::Microsoft::UI::Text::TextGetOptions::None, raw);
+            std::wstring cur(raw);
+            while (!cur.empty() && iswspace(cur.back())) cur.pop_back();
+            return !t_typedQuery.empty() && cur.rfind(t_typedQuery, 0) == 0;
+        };
+        if (t_relayStep == Relay::WaitBox) {
+            if (auto box = FocusedNewTabBox(); box && !t_pendingQuery.empty()) {
+                // Hide the New Tab page while this runs: you see the new tab go straight to the URL.
+                for (mux::DependencyObject d = box; d; d = muxm::VisualTreeHelper::GetParent(d))
+                    if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"VariantHost") {
+                        fe.Opacity(0);
+                        t_hiddenPage = winrt::make_weak(fe.as<mux::UIElement>());
+                        break;
+                    }
+                // Type it as real input so Dia's own query logic sees it (setting the text directly doesn't).
+                std::vector<INPUT> in;
+                if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // Ctrl still held from Ctrl+T would turn letters into shortcuts
+                    INPUT up{};
+                    up.type = INPUT_KEYBOARD;
+                    up.ki.wVk = VK_CONTROL;
+                    up.ki.dwFlags = KEYEVENTF_KEYUP;
+                    in.push_back(up);
                 }
+                for (wchar_t ch : t_pendingQuery) {
+                    INPUT d{};
+                    d.type = INPUT_KEYBOARD;
+                    d.ki.wScan = ch;
+                    d.ki.dwFlags = KEYEVENTF_UNICODE;
+                    INPUT u = d;
+                    u.ki.dwFlags |= KEYEVENTF_KEYUP;
+                    in.push_back(d);
+                    in.push_back(u);
+                }
+                SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
+                t_typedQuery = t_pendingQuery;
+                t_pendingQuery.clear();
+                t_relayBox = winrt::make_weak(box);
+                t_relayStep = Relay::WaitText;
+                t_relayAt = 0;
+                t_enterTries = 0;
+                // Long text takes Dia a while to take in, one key at a time.
+                t_relayDeadline = now + 3000 + 5.0 * t_typedQuery.size();
+                done = false;
             }
-            bool fire = (t_settle >= 0 && --t_settle < 0) || --t_enterIn == 0;
-            if (fire) {
+        } else if (t_relayStep == Relay::WaitText) {
+            // Enter only works once Dia's own query has the text, a moment after the box shows it: wait
+            // for the box to hold what we typed, then a little more.
+            auto box = t_relayBox.get();
+            if (box && t_relayAt == 0 && holdsText(box)) t_relayAt = now;
+            if ((t_relayAt != 0 && now - t_relayAt >= 120) || (done && box)) {
                 SendKeys({{VK_RETURN, true}, {VK_RETURN, false}});  // open it
-                UnhidePageLater();
+                t_enterTries = 1;
+                t_relayAt = now;
+                t_relayStep = Relay::Verify;
+                t_relayDeadline = now + 2500;
+                done = false;
+            }
+        } else {  // Relay::Verify
+            // Dia can still drop that Enter (its query not ready yet). The box keeping focus and our text
+            // means the tab didn't go anywhere: press Enter again, a few times at most.
+            auto box = t_relayBox.get();
+            bool stuck = box && box == FocusedNewTabBox() && holdsText(box);
+            if (!stuck) {
                 done = true;
+            } else if (now - t_relayAt >= 350 && t_enterTries < 4) {
+                SendKeys({{VK_RETURN, true}, {VK_RETURN, false}});
+                t_enterTries++;
+                t_relayAt = now;
+            } else if (done) {
             }
-        } else if (auto box = FocusedNewTabBox(); box && !t_pendingQuery.empty()) {
-            // Hide the New Tab page while this runs: you see the new tab go straight to the URL.
-            for (mux::DependencyObject d = box; d; d = muxm::VisualTreeHelper::GetParent(d))
-                if (auto fe = d.try_as<mux::FrameworkElement>(); fe && fe.Name() == L"VariantHost") {
-                    fe.Opacity(0);
-                    t_hiddenPage = winrt::make_weak(fe.as<mux::UIElement>());
-                    break;
-                }
-            // Type it as real input so Dia's own query logic sees it (setting the text directly doesn't).
-            std::vector<INPUT> in;
-            if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {  // Ctrl still held from Ctrl+T would turn letters into shortcuts
-                INPUT up{};
-                up.type = INPUT_KEYBOARD;
-                up.ki.wVk = VK_CONTROL;
-                up.ki.dwFlags = KEYEVENTF_KEYUP;
-                in.push_back(up);
-            }
-            for (wchar_t ch : t_pendingQuery) {
-                INPUT d{};
-                d.type = INPUT_KEYBOARD;
-                d.ki.wScan = ch;
-                d.ki.dwFlags = KEYEVENTF_UNICODE;
-                INPUT u = d;
-                u.ki.dwFlags |= KEYEVENTF_KEYUP;
-                in.push_back(d);
-                in.push_back(u);
-            }
-            SendInput((UINT)in.size(), in.data(), sizeof(INPUT));
-            t_typedQuery = t_pendingQuery;
-            t_pendingQuery.clear();
-            t_settle = -1;
-            t_enterIn = 120;  // until Dia has the text (see above), at most ~2 s
-            t_submitFrames = (std::max)(t_submitFrames, 120);
         }
         if (done) {
             muxm::CompositionTarget::Rendering(t_submitToken);
             t_submitToken = {};
             t_pendingQuery.clear();
-            t_passCtrlT = false;
-            t_enterIn = -1;
-            if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // gave up: never leave it hidden
+            t_typedQuery.clear();
+            t_relayBox = nullptr;
+            g_arcPassCtrlT = false;
+            if (t_hiddenPage.get() && !t_unhideToken) UnhidePageLater();  // never leave it hidden
             if (!t_hiddenPage.get() && !t_unhideToken) t_relayText.clear(), ScheduleArcAdopt();
         }
     });
@@ -6374,8 +6529,13 @@ void Ui_OpenInNewTab(const std::wstring& text) {
 
 static LRESULT CALLBACK ArcMsgProc(HWND h, UINT msg, WPARAM wp, LPARAM lp) {
     try {
-        if (msg == WM_ARC_CTRL_T) StartNewTabMode();
-        else if (msg == WM_ARC_ENTER) SubmitInNewTab();
+        if (msg == WM_ARC_CTRL_T) {
+            StartNewTabMode();
+        } else if (msg == WM_ARC_ENTER) {
+            // The hook went by a flag up to a tick old: focus left the box since, so give the Enter back.
+            if (t_newTabMode && FocusedQueryBox()) SubmitInNewTab();
+            else g_arcEnterSubmits = false, SendKeys({{VK_RETURN, true}, {VK_RETURN, false}});
+        }
     } catch (...) {
     }
     return DefWindowProcW(h, msg, wp, lp);
@@ -6387,21 +6547,23 @@ static bool DiaIsForeground() {
     return pid == GetCurrentProcessId();
 }
 
-// Low-level keyboard hook (runs on this UI thread's message loop). Only acts while Dia is the active app.
+// Low-level keyboard hook, on a thread of its own (see llhook.h): it must not touch XAML or the UI
+// thread's state, only the atomics above. Set only while Floating New Tab is on; acts only while Dia is
+// the active app.
 static LRESULT CALLBACK ArcKeyHook(int code, WPARAM wp, LPARAM lp) {
     if (code == HC_ACTION && (wp == WM_KEYDOWN || wp == WM_SYSKEYDOWN)) {
         auto* k = reinterpret_cast<KBDLLHOOKSTRUCT*>(lp);
         // (Our own Ctrl+L / Alt+Enter never match below, so they can't loop.)
-        if (Engine_TweakOn(L"floatingNewTab") && DiaIsForeground()) {
+        if ((k->vkCode == 'T' || k->vkCode == VK_RETURN) && DiaIsForeground()) {
             bool ctrl = GetAsyncKeyState(VK_CONTROL) & 0x8000, alt = GetAsyncKeyState(VK_MENU) & 0x8000,
                  shift = GetAsyncKeyState(VK_SHIFT) & 0x8000;
-            if (k->vkCode == 'T' && ctrl && !alt && !shift && t_passCtrlT) {
-                t_passCtrlT = false;  // our own new-tab request: Dia handles this one
+            if (k->vkCode == 'T' && ctrl && !alt && !shift && g_arcPassCtrlT.exchange(false)) {
+                // our own new-tab request: Dia handles this one
             } else if (k->vkCode == 'T' && ctrl && !alt && !shift) {
                 PostMessageW(g_arcMsgWnd, WM_ARC_CTRL_T, 0, 0);
                 return 1;  // Dia never sees it: no New Tab page
             }
-            if (k->vkCode == VK_RETURN && !ctrl && !alt && !shift && t_newTabMode && FocusedQueryBox()) {
+            if (k->vkCode == VK_RETURN && !ctrl && !alt && !shift && g_arcEnterSubmits.exchange(false)) {
                 PostMessageW(g_arcMsgWnd, WM_ARC_ENTER, 0, 0);
                 return 1;
             }
@@ -6410,23 +6572,39 @@ static LRESULT CALLBACK ArcKeyHook(int code, WPARAM wp, LPARAM lp) {
     return CallNextHookEx(nullptr, code, wp, lp);
 }
 
-static void InstallArcKeys() {
-    if (g_arcMsgWnd) return;
-    WNDCLASSW wc{};
-    wc.lpfnWndProc = ArcMsgProc;
-    wc.hInstance = GetModuleHandleW(nullptr);
-    wc.lpszClassName = L"DiaTweaksArcKeys";
-    RegisterClassW(&wc);
-    g_arcMsgWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
-    HMODULE self = nullptr;
-    GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                       (LPCWSTR)&ArcKeyHook, &self);
-    if (!SetWindowsHookExW(WH_KEYBOARD_LL, ArcKeyHook, self, 0)) Log("Arc keys: hook failed %lu", GetLastError());
+static LowLevelHookThread g_arcHooks;
+static DWORD g_arcThread = 0;  // the UI thread that owns the message window (and new-tab mode)
+
+// The key hook while Floating New Tab is on; none (no cost to your typing) while it's off.
+static void SetArcKeys(bool on) {
+    if (!g_arcThread) {
+        if (!on) return;
+        WNDCLASSW wc{};
+        wc.lpfnWndProc = ArcMsgProc;
+        wc.hInstance = GetModuleHandleW(nullptr);
+        wc.lpszClassName = L"DiaTweaksArcKeys";
+        RegisterClassW(&wc);
+        g_arcMsgWnd = CreateWindowExW(0, wc.lpszClassName, L"", 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+        g_arcThread = GetCurrentThreadId();
+    }
+    if (GetCurrentThreadId() != g_arcThread) return;
+    static bool failed = false;  // (not tried again every tick: once more after the tweak is turned off and on)
+    if (!on) failed = false;
+    if (on == g_arcHooks.Running() || (on && failed)) return;
+    if (!on) {
+        g_arcHooks.Stop();
+        g_arcPassCtrlT = false;
+        g_arcEnterSubmits = false;
+    } else if (!g_arcHooks.Start(nullptr, ArcKeyHook)) {
+        failed = true;
+        Log("Arc keys: hook failed %lu", g_arcHooks.Error());
+    }
 }
 
-// The empty-bar mode ends when the command bar closes.
+// The empty-bar mode ends when the command bar closes. (And the key hook hears where it stands.)
 static void UpdateNewTabMode() {
     if (t_newTabMode && !t_clearToken && !FocusedQueryBox()) t_newTabMode = false;
+    g_arcEnterSubmits = t_newTabMode && !t_clearToken;  // (the box is focused: just checked)
 }
 
 // ---------------------------------------------------------------- Toolbar in the title bar
@@ -8038,6 +8216,8 @@ static std::vector<winrt::Windows::Graphics::RectInt32> RegularToolbarClickRects
     return out;
 }
 
+HWND Ui_TopWindowFor(const mux::XamlRoot& root) { return TopWindowFor(root); }  // (media.cpp)
+
 // The strip's empty space, in window pixels: the strip minus its left buttons, the centered group and
 // its right buttons. That's what drags the window, as in Arc's title bar.
 static std::vector<winrt::Windows::Graphics::RectInt32> ToolbarDragRects(const mux::XamlRoot& root) {
@@ -8633,7 +8813,7 @@ bool Ui_Tick() {
             if (logged < 20) logged++, Log("ui tick error (titleBar)");
         }
         stage = "commandBar";
-        if (Engine_TweakOn(L"floatingNewTab")) InstallArcKeys();
+        SetArcKeys(Engine_TweakOn(L"floatingNewTab"));
         if ((Engine_TweakOn(L"floatingNewTab") || ArcWindowsOn()) && !ArcSidebarOn())
             HookCommandBarPopovers();  // (Arc mode hooks them already)
         stage = "newTab";
@@ -8645,6 +8825,8 @@ bool Ui_Tick() {
         UpdateCleanSearchBox();
         History_Tick();
         UpdateTidyTabs();
+        stage = "media";
+        Media_Tick();
         if (tick % 3 == 0) {
             stage = "look";
             UpdateWindowMaterial();
@@ -8706,16 +8888,27 @@ static mux::FrameworkElement FirstIn(const mux::DependencyObject& root,
     return nullptr;
 }
 
+static mux::FrameworkElement PeekTabLabelExact(const mux::FrameworkElement& list, HWND window);
+
+// The window's tab list. A window can hold more than one (one left over from its first layout, still
+// showing "New Tab"): the one whose tab is the window's page is preferred, then one that's shown.
 static mux::FrameworkElement PeekTabList(HWND window) {
+    std::vector<mux::FrameworkElement> lists;
     for (auto h : FindNodes(L"TabListPresenter")) {
         auto list = Obj<mux::FrameworkElement>(h);
         auto root = list ? list.XamlRoot() : nullptr;
         if (!root) continue;
         auto env = root.ContentIslandEnvironment();
         HWND top = env ? GetAncestor((HWND)(uintptr_t)env.AppWindowId().Value, GA_ROOT) : nullptr;
-        if ((top ? top : TopWindowFor(root)) == window) return list;
+        if ((top ? top : TopWindowFor(root)) == window) lists.push_back(list);
     }
-    return nullptr;
+    if (lists.size() > 1) {
+        for (auto& l : lists)
+            if (PeekTabLabelExact(l, window)) return l;
+        for (auto& l : lists)
+            if (l.ActualWidth() > 1 && l.ActualHeight() > 1 && l.Visibility() == mux::Visibility::Visible) return l;
+    }
+    return lists.empty() ? nullptr : lists.front();
 }
 
 // Dia's menu labels, compared ignoring case: Dia 1.6 writes "Move to window" and "New window" where 1.5
@@ -8727,7 +8920,20 @@ static bool EndsWithNoCase(std::wstring_view s, std::wstring_view suffix) {
     return s.size() >= suffix.size() && _wcsnicmp(s.data() + s.size() - suffix.size(), suffix.data(), suffix.size()) == 0;
 }
 
-static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
+// Is this tab label the tab a window title names? Either may be cut short (one starts the other). With
+// more than one profile, Dia puts the profile's name before the page's in the window title ("Work: Apps |
+// Dia Browser" for the tab "Apps | Dia Browser"), so the title is also tried without it.
+static bool TabLabelMatches(const std::wstring& label, const std::wstring& title) {
+    if (label.empty() || label == L"New Tab" || title.empty()) return false;
+    if (label.starts_with(title) || title.starts_with(label)) return true;
+    size_t colon = title.find(L": ");
+    if (colon == std::wstring::npos) return false;
+    std::wstring page = title.substr(colon + 2);
+    return !page.empty() && (label.starts_with(page) || page.starts_with(label));
+}
+
+// The tab whose label is the window's title (its page), if the list shows it.
+static mux::FrameworkElement PeekTabLabelExact(const mux::FrameworkElement& list, HWND window) {
     wchar_t title[512]{};
     GetWindowTextW(window, title, ARRAYSIZE(title));
     auto untrimmed = [](std::wstring text) {
@@ -8740,9 +8946,31 @@ static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWN
     return FirstIn(list, [&](const mux::FrameworkElement& fe) {
         auto text = fe.try_as<muxc::TextBlock>();
         if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
-        std::wstring label = untrimmed(std::wstring(text.Text()));
-        return !label.empty() && label != L"New Tab" &&
-               (label.starts_with(name) || name.starts_with(label));
+        return TabLabelMatches(untrimmed(std::wstring(text.Text())), name);
+    });
+}
+
+static mux::FrameworkElement PeekTabLabel(const mux::FrameworkElement& list, HWND window) {
+    wchar_t title[512]{};
+    GetWindowTextW(window, title, ARRAYSIZE(title));
+    auto untrimmed = [](std::wstring text) {
+        if (text.ends_with(L"…")) text.pop_back();
+        else if (text.ends_with(L"...")) text.resize(text.size() - 3);
+        return text;
+    };
+    std::wstring name = untrimmed(title);
+    if (name.empty()) return nullptr;
+    auto match = FirstIn(list, [&](const mux::FrameworkElement& fe) {
+        auto text = fe.try_as<muxc::TextBlock>();
+        if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
+        return TabLabelMatches(untrimmed(std::wstring(text.Text())), name);
+    });
+    if (match) return match;
+    // The preview's window holds one tab, whose label can lag its title (still "New Tab" a while after
+    // the page has its own): its first label, then.
+    return FirstIn(list, [&](const mux::FrameworkElement& fe) {
+        auto text = fe.try_as<muxc::TextBlock>();
+        return text && fe.ActualWidth() > 1 && fe.ActualHeight() > 1 && !text.Text().empty();
     });
 }
 
@@ -8751,18 +8979,74 @@ bool Ui_PeekTabRow(HWND win, RECT& out) {
         auto list = PeekTabList(win);
         auto label = list ? PeekTabLabel(list, win) : nullptr;
         if (!label) return false;
-        double scale = label.XamlRoot().RasterizationScale();
-        auto o = label.TransformToVisual(nullptr).TransformPoint({0, 0});
+        // (laid out now: a window kept off the screen can be a frame or more behind its new size)
+        if (auto content = list.XamlRoot().Content()) content.UpdateLayout();
+        // The tab's whole row (the widest element around its label, no taller than a row), not only its
+        // text: a short title leaves little of the row to click.
+        auto row = label;
+        for (auto e = label; e && e != list; e = muxm::VisualTreeHelper::GetParent(e).try_as<mux::FrameworkElement>()) {
+            if (e.Name() == L"RowsPanel") break;
+            if (e.ActualHeight() <= label.ActualHeight() * 3 && e.ActualWidth() > row.ActualWidth()) row = e;
+        }
+        double scale = row.XamlRoot().RasterizationScale();
+        auto o = row.TransformToVisual(nullptr).TransformPoint({0, 0});
         POINT origin{};
         if (!ClientToScreen(win, &origin)) return false;
         out.left = origin.x + (LONG)std::lround(o.X * scale);
         out.top = origin.y + (LONG)std::lround(o.Y * scale);
-        out.right = out.left + (LONG)std::lround(label.ActualWidth() * scale);
-        out.bottom = out.top + (LONG)std::lround(label.ActualHeight() * scale);
+        out.right = out.left + (LONG)std::lround(row.ActualWidth() * scale);
+        out.bottom = out.top + (LONG)std::lround(row.ActualHeight() * scale);
         return !IsRectEmpty(&out);
     } catch (...) {
         return false;
     }
+}
+
+std::wstring Ui_PeekTabInfo(HWND win) {
+    std::wstring out;
+    try {
+        wchar_t title[256]{};
+        GetWindowTextW(win, title, ARRAYSIZE(title));
+        out = L"title '" + std::wstring(title) + L"'";
+        auto list = PeekTabList(win);
+        if (!list) return out + L", no tab list";
+        out += L", labels:";
+        int n = 0;
+        FirstIn(list, [&](const mux::FrameworkElement& fe) {
+            if (auto text = fe.try_as<muxc::TextBlock>(); text && !text.Text().empty()) {
+                out += L" '" + std::wstring(text.Text()) + (fe.ActualWidth() <= 1 ? L"' (hidden)" : L"'");
+                ++n;
+            }
+            return n >= 12;
+        });
+    } catch (...) {
+    }
+    return out;
+}
+
+std::wstring Ui_PeekMenuInfo(HWND win) {
+    std::wstring out;
+    try {
+        auto list = PeekTabList(win);
+        if (!list) return L"no tab list";
+        auto pops = muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot());
+        out = std::to_wstring(pops.Size()) + L" popups open";
+        int n = 0;
+        for (auto const& pop : pops) {
+            auto child = pop.Child();
+            if (!child) continue;
+            FirstIn(child, [&](const mux::FrameworkElement& fe) {
+                if (auto sub = fe.try_as<muxc::MenuFlyoutSubItem>()) out += L" [" + std::wstring(sub.Text()) + L" >]", ++n;
+                else if (auto item = fe.try_as<muxc::MenuFlyoutItem>()) out += L" [" + std::wstring(item.Text()) + L"]", ++n;
+                return n >= 20;
+            });
+        }
+        wchar_t fg[128]{};
+        GetWindowTextW(GetForegroundWindow(), fg, ARRAYSIZE(fg));
+        out += L"; in front: '" + std::wstring(fg) + (GetForegroundWindow() == win ? L"' (the preview)" : L"'");
+    } catch (...) {
+    }
+    return out;
 }
 
 bool Ui_PeekShowTabMenu(HWND window) {
@@ -8779,6 +9063,15 @@ bool Ui_PeekShowTabMenu(HWND window) {
     } catch (...) {
     }
     return false;
+}
+
+bool Ui_PeekMenuOpen(HWND win) {
+    try {
+        auto list = PeekTabList(win);
+        return list && muxm::VisualTreeHelper::GetOpenPopupsForXamlRoot(list.XamlRoot()).Size() > 0;
+    } catch (...) {
+        return false;
+    }
 }
 
 void Ui_PeekCloseTabMenu(HWND window) {
@@ -8838,8 +9131,7 @@ bool Ui_PeekTabRowNamed(HWND win, const std::wstring& title, RECT& out) {
         auto label = FirstIn(list, [&](const mux::FrameworkElement& fe) {
             auto text = fe.try_as<muxc::TextBlock>();
             if (!text || fe.ActualWidth() <= 1 || fe.ActualHeight() <= 1) return false;
-            std::wstring l = untrimmed(std::wstring(text.Text()));
-            return !l.empty() && l != L"New Tab" && (l.starts_with(name) || name.starts_with(l));
+            return TabLabelMatches(untrimmed(std::wstring(text.Text())), name);
         });
         if (!label) return false;
         double scale = label.XamlRoot().RasterizationScale();
